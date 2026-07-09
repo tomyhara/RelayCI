@@ -1,3 +1,8 @@
 /doc/ci-runner-spec.md
 /doc/ci-runner-test-spec.md
 /doc/ci-runner-dsl-spec.md
+
+# .NET build artifacts
+[Bb]in/
+[Oo]bj/
+*.user
