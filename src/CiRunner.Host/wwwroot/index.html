@@ -1,197 +1,644 @@
 <!DOCTYPE html>
-<html lang="ja">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CI Runner</title>
+<title>RelayCI</title>
 <style>
-  :root {
-    --bg: #0f1115; --panel: #171a21; --border: #2a2e38; --text: #e6e8ee; --muted: #9aa1ae;
-    --accent: #4f8cff; --success: #34c759; --failed: #ff5a52; --running: #f5a623; --idle: #6b7280;
-  }
-  * { box-sizing: border-box; }
-  body { margin: 0; font-family: -apple-system, Segoe UI, Meiryo, sans-serif; background: var(--bg); color: var(--text); }
-  header { padding: 12px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 12px; }
-  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
-  main { display: flex; height: calc(100vh - 49px); }
-  #job-list { width: 280px; border-right: 1px solid var(--border); overflow-y: auto; flex-shrink: 0; }
-  #detail { flex: 1; overflow-y: auto; padding: 20px; }
-  .job-item { padding: 12px 16px; border-bottom: 1px solid var(--border); cursor: pointer; }
-  .job-item:hover { background: var(--panel); }
-  .job-item.active { background: var(--panel); border-left: 3px solid var(--accent); }
-  .job-name { font-weight: 600; font-size: 14px; }
-  .job-sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; text-transform: uppercase; }
-  .badge.success { background: rgba(52,199,89,.15); color: var(--success); }
-  .badge.failed, .badge.aborted { background: rgba(255,90,82,.15); color: var(--failed); }
-  .badge.running { background: rgba(245,166,35,.15); color: var(--running); }
-  .badge.queued, .badge.waiting { background: rgba(107,114,128,.2); color: var(--idle); }
-  button { background: var(--accent); color: #fff; border: none; padding: 8px 16px; border-radius: 6px; font-size: 13px; cursor: pointer; }
-  button:hover { opacity: .9; }
-  button:disabled { opacity: .5; cursor: not-allowed; }
-  table { width: 100%; border-collapse: collapse; margin-top: 12px; }
-  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 13px; }
-  tr.build-row { cursor: pointer; }
-  tr.build-row:hover { background: var(--panel); }
-  #log { background: #0a0b0e; border: 1px solid var(--border); border-radius: 6px; padding: 12px; font-family: Consolas, monospace; font-size: 12.5px; white-space: pre-wrap; word-break: break-all; max-height: 60vh; overflow-y: auto; margin-top: 12px; }
-  .steps { margin-top: 12px; }
-  .step { border: 1px solid var(--border); border-radius: 6px; margin-bottom: 6px; padding: 8px 12px; font-size: 13px; display: flex; justify-content: space-between; align-items: center; }
-  .muted { color: var(--muted); }
-  a.back { color: var(--accent); cursor: pointer; font-size: 13px; text-decoration: none; }
+/* Design tokens adapted from doc/Relay CI.dc.html. Google Fonts CDN swapped for system font
+   stacks: the spec (§1/§3) requires zero CDN / internet dependency (LAN-only deployment). */
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  font-family:-apple-system,'Segoe UI',system-ui,'Yu Gothic UI',sans-serif;
+  -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
+}
+a{color:var(--accent);text-decoration:none}
+::selection{background:var(--accent);color:#fff}
+input,button,select,textarea{font-family:inherit}
+button{cursor:pointer}
+
+:root, [data-theme="dark"]{
+  --bg:#0c0e12;--surface:#14171d;--surface-2:#1a1e26;--surface-3:#20252f;
+  --border:#242a34;--border-2:#333b47;
+  --text:#e7ebf2;--text-2:#98a2b2;--text-3:#616b7b;
+  --accent:#6d5cf0;--accent-2:#a394ff;--accent-soft:rgba(109,92,240,.18);
+  --shadow:0 1px 2px rgba(0,0,0,.5),0 8px 24px rgba(0,0,0,.4);
+  --st-success:#34d17f;--st-success-soft:#123020;
+  --st-failed:#f76d6d;--st-failed-soft:#331515;
+  --st-running:#f0b429;--st-running-soft:#332612;
+  --st-queued:#8b95a5;--st-queued-soft:#1e242e;
+  --st-waiting:#6ea8ff;--st-waiting-soft:#132238;
+  --st-aborted:#b8b19f;--st-aborted-soft:#26251f;
+  --term-bg:#08090d;--term-line:#12161d;--term-text:#c6cede;--term-dim:#5a6474;
+}
+[data-theme="light"]{
+  --bg:#eceff3;--surface:#ffffff;--surface-2:#f4f6f9;--surface-3:#e9edf2;
+  --border:#e2e6ec;--border-2:#ccd2dc;
+  --text:#12151b;--text-2:#586173;--text-3:#8b94a4;
+  --accent:#6d5cf0;--accent-2:#4a3ad0;--accent-soft:rgba(109,92,240,.12);
+  --shadow:0 1px 2px rgba(20,25,35,.06),0 6px 16px rgba(20,25,35,.06);
+  --st-success:#12915a;--st-success-soft:#dcf3e8;
+  --st-failed:#d43a3a;--st-failed-soft:#fbe3e3;
+  --st-running:#c47d0a;--st-running-soft:#fbeecf;
+  --st-queued:#5b6472;--st-queued-soft:#e7eaef;
+  --st-waiting:#2f6fd0;--st-waiting-soft:#e2ecfb;
+  --st-aborted:#8a8578;--st-aborted-soft:#ecece4;
+  --term-bg:#0d1016;--term-line:#161b22;--term-text:#c6cede;--term-dim:#6b7686;
+}
+@media (prefers-color-scheme: light) { :root:not([data-theme]) { color-scheme: light; } }
+
+@keyframes rc-pulse{0%,100%{opacity:1}50%{opacity:.35}}
+@keyframes rc-spin{to{transform:rotate(360deg)}}
+@keyframes rc-blink{0%,100%{opacity:1}50%{opacity:0}}
+@keyframes rc-fade{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+.fade{animation:rc-fade .2s ease}
+.spin{animation:rc-spin .9s linear infinite}
+.pulse{animation:rc-pulse 1.4s ease-in-out infinite}
+
+::-webkit-scrollbar{width:11px;height:11px}
+::-webkit-scrollbar-thumb{background:var(--border-2);border-radius:6px;border:3px solid transparent;background-clip:padding-box}
+::-webkit-scrollbar-track{background:transparent}
+
+body{background:var(--bg);color:var(--text);font-size:13px;line-height:1.45}
+.mono{font-family:ui-monospace,'Cascadia Code',Consolas,'SF Mono',monospace}
+.display{font-weight:600;letter-spacing:-.02em}
+
+#shell{display:grid;grid-template-columns:216px 1fr;grid-template-rows:52px 1fr;height:100vh;overflow:hidden}
+header{grid-column:1/-1;display:flex;align-items:center;gap:16px;padding:0 16px 0 18px;background:var(--surface);border-bottom:1px solid var(--border);z-index:20}
+.logo{display:flex;align-items:center;gap:9px;width:198px;cursor:pointer}
+.logo .mark{width:24px;height:24px;border-radius:6px;background:var(--accent);display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.logo .mark span{width:9px;height:9px;border:2.2px solid #fff;border-radius:50%;border-right-color:transparent}
+.logo .word{font-weight:700;font-size:15px;letter-spacing:-.02em}
+.logo .word b{color:var(--accent-2);font-weight:700}
+.searchbox{flex:1;max-width:420px;display:flex;align-items:center;gap:8px;padding:6px 11px;background:var(--surface-2);border:1px solid var(--border);border-radius:8px;color:var(--text-3)}
+.searchbox input{flex:1;background:transparent;border:none;outline:none;color:var(--text);font-size:12.5px}
+.searchbox input::placeholder{color:var(--text-3)}
+.iconbtn{width:34px;height:34px;display:flex;align-items:center;justify-content:center;background:var(--surface-2);border:1px solid var(--border);border-radius:8px;color:var(--text-2)}
+.iconbtn:hover{color:var(--text);border-color:var(--border-2)}
+
+nav{background:var(--surface);border-right:1px solid var(--border);padding:14px 10px;display:flex;flex-direction:column;gap:2px;overflow-y:auto}
+.navitem{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:8px;cursor:pointer;color:var(--text-2);font-size:13px}
+.navitem:hover{background:var(--surface-2)}
+.navitem.active{color:var(--text);background:var(--accent-soft);font-weight:600}
+.navitem svg{flex-shrink:0}
+.navitem .badge{margin-left:auto;font-size:10px;padding:1px 6px;border-radius:10px;background:var(--surface-3);color:var(--text-2)}
+.navsep{height:1px;background:var(--border);margin:12px 6px}
+.navlabel{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--text-3);padding:4px 10px 6px}
+.runnerbox{padding:8px 10px;display:flex;flex-direction:column;gap:9px;font-size:12px}
+.runnerrow{display:flex;align-items:center;justify-content:space-between}
+.bar{height:5px;border-radius:3px;background:var(--surface-3);overflow:hidden}
+.bar>div{height:100%;background:var(--st-running)}
+.healthdot{width:7px;height:7px;border-radius:50%;background:var(--st-success);box-shadow:0 0 7px var(--st-success);flex-shrink:0}
+
+main{overflow-y:auto;position:relative}
+.page{padding:22px 26px 40px}
+.crumb{font-size:12px;color:var(--text-3);margin-bottom:10px}
+.crumb span.link{cursor:pointer}
+.crumb span.link:hover{color:var(--text-2)}
+.pagehead{display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:20px;flex-wrap:wrap;gap:12px}
+h1{font-size:22px;margin:0 0 3px}
+.sub{color:var(--text-2);margin:0;font-size:13px}
+.btn{padding:8px 14px;border-radius:8px;font-size:13px;font-weight:600;border:1px solid var(--border-2);background:var(--surface);color:var(--text)}
+.btn:hover{border-color:var(--text-3)}
+.btn.primary{background:var(--accent);border:none;color:#fff;box-shadow:0 5px 14px -7px var(--accent)}
+.btn.primary:hover{background:var(--accent-2)}
+.btn.danger{background:var(--st-failed-soft);border:1px solid var(--st-failed);color:var(--st-failed)}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+
+.statgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}
+.statcard{padding:13px 15px;background:var(--surface);border:1px solid var(--border);border-radius:10px}
+.statcard .lbl{display:flex;align-items:center;gap:7px;color:var(--text-2);font-size:11.5px;font-weight:500;text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px}
+.statcard .dot{width:8px;height:8px;border-radius:2px}
+.statcard .val{font-size:26px;font-weight:600;letter-spacing:-.02em}
+.statcard .sub{font-size:11px;color:var(--text-3);margin-top:2px}
+
+.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;box-shadow:var(--shadow)}
+.thead{display:grid;gap:12px;padding:9px 16px;background:var(--surface-2);border-bottom:1px solid var(--border);font-size:10.5px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--text-3)}
+.trow{display:grid;gap:12px;padding:12px 16px;border-bottom:1px solid var(--border);align-items:center}
+.trow:last-child{border-bottom:none}
+.trow.clickable{cursor:pointer}
+.trow.clickable:hover{background:var(--surface-2)}
+
+.badge-status{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:20px;font-size:11.5px;font-weight:600}
+.badge-status .d{width:6px;height:6px;border-radius:50%}
+
+.sparkline{display:flex;gap:3px;align-items:flex-end;height:26px}
+.sparkline span{flex:1;border-radius:2px;min-width:5px}
+
+.emptystate{padding:48px;text-align:center;background:var(--surface);border:1px dashed var(--border-2);border-radius:12px;color:var(--text-3)}
+
+.buildhead{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px 18px;margin-bottom:16px;box-shadow:var(--shadow)}
+.gantt{margin-top:14px;display:flex;gap:2px;height:8px;border-radius:4px;overflow:hidden;background:var(--surface-3)}
+
+.step{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;box-shadow:var(--shadow);margin-bottom:8px}
+.stephead{display:grid;grid-template-columns:26px 1fr auto auto;gap:12px;align-items:center;padding:11px 14px;cursor:pointer}
+.stephead:hover{background:var(--surface-2)}
+.stepicon{width:20px;height:20px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700}
+.steplog{max-height:420px;overflow-y:auto;background:var(--term-bg);border-top:1px solid var(--border);padding:11px 0;font-size:11.5px;line-height:1.65}
+.logline{display:flex;padding:0 14px;white-space:pre-wrap;word-break:break-word}
+.logline:hover{background:var(--term-line)}
+.logline .t{color:var(--term-dim);flex-shrink:0;width:88px;user-select:none}
+.logline .m{flex:1;color:var(--term-text)}
+.cursor{display:inline-block;width:8px;height:14px;background:var(--st-running);animation:rc-blink 1s step-end infinite;vertical-align:middle}
+
+.hint{padding:11px 13px;background:var(--surface-2);border:1px solid var(--border);border-radius:8px;font-size:11.5px;color:var(--text-2)}
 </style>
 </head>
 <body>
-<header>
-  <h1>CI Runner</h1>
-  <span class="muted" id="conn-status"></span>
-</header>
-<main>
-  <div id="job-list"></div>
-  <div id="detail"><p class="muted">ジョブを選択してください</p></div>
-</main>
-<script>
-const state = { selectedJob: null, selectedBuild: null, logSource: null };
-
-async function api(path, opts) {
-  const res = await fetch(path, opts);
-  if (!res.ok) throw new Error(`${path}: ${res.status}`);
-  return res.headers.get('content-type')?.includes('application/json') ? res.json() : res.text();
-}
-
-function badge(status) {
-  return `<span class="badge ${status}">${status}</span>`;
-}
-
-function fmtTime(iso) {
-  if (!iso) return '-';
-  return new Date(iso).toLocaleString('ja-JP');
-}
-
-async function loadJobs() {
-  const jobs = await api('/api/jobs');
-  const list = document.getElementById('job-list');
-  list.innerHTML = jobs.map(j => `
-    <div class="job-item ${state.selectedJob === j.name ? 'active' : ''}" data-job="${j.name}">
-      <div class="job-name">${j.name}</div>
-      <div class="job-sub">
-        ${j.latestBuild ? `#${j.latestBuild.number} ${badge(j.latestBuild.status)}` : '<span class="muted">ビルドなし</span>'}
+<div id="shell">
+  <header>
+    <div class="logo" onclick="navigate('/jobs')">
+      <div class="mark"><span></span></div>
+      <span class="word display">Relay<b>CI</b></span>
+    </div>
+    <div class="searchbox" id="search-wrap">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      <input id="search-input" placeholder="Filter jobs…" oninput="onSearch(this.value)">
+    </div>
+    <div style="flex:1"></div>
+    <button class="iconbtn" title="Toggle theme" onclick="toggleTheme()"><span id="theme-icon"></span></button>
+  </header>
+  <nav>
+    <div class="navitem" data-nav="jobs" onclick="navigate('/jobs')">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+      <span>Jobs</span><span class="badge" id="nav-running-badge" style="display:none"></span>
+    </div>
+    <div class="navitem" data-nav="queue" onclick="navigate('/queue')">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M3 12h18M3 18h12"/></svg>
+      <span>Queue</span><span class="badge" id="nav-queue-badge" style="display:none"></span>
+    </div>
+    <div class="navsep"></div>
+    <div class="navlabel">Runner</div>
+    <div class="runnerbox">
+      <div class="runnerrow"><span style="color:var(--text-2)">Executors</span><span class="mono" id="rb-executors">–</span></div>
+      <div class="bar"><div id="rb-bar" style="width:0%"></div></div>
+      <div style="display:flex;align-items:center;gap:7px;margin-top:2px">
+        <span class="healthdot"></span>
+        <span class="mono" id="rb-health" style="color:var(--text-2);font-size:11px">healthy</span>
       </div>
     </div>
-  `).join('') || '<p class="muted" style="padding:16px">jobs/&lt;name&gt;/pipeline.cipipe を配置してください</p>';
+  </nav>
+  <main id="main"></main>
+</div>
+<script>
+'use strict';
 
-  list.querySelectorAll('.job-item').forEach(el => {
-    el.addEventListener('click', () => selectJob(el.dataset.job));
-  });
+/* ---------- status metadata ---------- */
+const STATUS_META = {
+  success:{label:'Success',icon:'✓'}, failed:{label:'Failed',icon:'✕'},
+  running:{label:'Running',icon:'↻'}, queued:{label:'Queued',icon:'∙'},
+  waiting:{label:'Waiting',icon:'∙'}, aborted:{label:'Aborted',icon:'■'},
+};
+function meta(s){
+  const m = STATUS_META[s] || {label:s||'—',icon:'∙'};
+  return {label:m.label, icon:m.icon, color:`var(--st-${s||'queued'})`, soft:`var(--st-${s||'queued'}-soft)`,
+    anim: s==='running' ? 'pulse' : ''};
+}
+function statusBadge(s){
+  const m = meta(s);
+  return `<span class="badge-status" style="background:${m.soft};color:${m.color}"><span class="d ${m.anim}" style="background:${m.color}"></span>${m.label}</span>`;
+}
+function esc(s){ return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function fmtTime(iso){ return iso ? new Date(iso).toLocaleString() : '–'; }
+function fmtRelative(iso){
+  if (!iso) return '–';
+  const sec = Math.max(0, Math.round((Date.now() - new Date(iso).getTime())/1000));
+  if (sec < 5) return 'now';
+  if (sec < 60) return sec+'s ago';
+  if (sec < 3600) return Math.floor(sec/60)+'m ago';
+  if (sec < 86400) return Math.floor(sec/3600)+'h ago';
+  return Math.floor(sec/86400)+'d ago';
+}
+function fmtDuration(startIso, endIso){
+  if (!startIso) return '–';
+  const end = endIso ? new Date(endIso) : new Date();
+  const sec = Math.max(0, Math.round((end - new Date(startIso))/1000));
+  if (sec < 60) return sec+'s';
+  return Math.floor(sec/60)+'m '+(sec%60)+'s';
 }
 
-async function selectJob(name) {
-  state.selectedJob = name;
-  state.selectedBuild = null;
-  await loadJobs();
-  await renderJobDetail(name);
+/* ---------- tiny fetch helper ---------- */
+async function api(path, opts){
+  const res = await fetch(path, opts);
+  if (!res.ok) throw new Error(path+': '+res.status);
+  const ct = res.headers.get('content-type') || '';
+  return ct.includes('application/json') ? res.json() : res.text();
 }
 
-async function renderJobDetail(name) {
-  const builds = await api(`/api/jobs/${encodeURIComponent(name)}/builds`);
-  const detail = document.getElementById('detail');
-  detail.innerHTML = `
-    <div style="display:flex; justify-content:space-between; align-items:center;">
-      <h2 style="margin:0">${name}</h2>
-      <button id="trigger-btn">手動トリガ</button>
-    </div>
-    <table>
-      <thead><tr><th>#</th><th>状態</th><th>トリガ</th><th>投入時刻</th><th>所要</th></tr></thead>
-      <tbody id="build-rows">
-        ${builds.map(b => `
-          <tr class="build-row" data-build="${b.id}">
-            <td>${b.number}</td><td>${badge(b.status)}</td><td>${b.trigger}</td>
-            <td>${fmtTime(b.queuedAt)}</td>
-            <td>${duration(b.startedAt, b.finishedAt)}</td>
-          </tr>`).join('')}
-      </tbody>
-    </table>
-    <div id="build-detail"></div>
-  `;
-  document.getElementById('trigger-btn').addEventListener('click', async () => {
-    await api(`/api/jobs/${encodeURIComponent(name)}/trigger`, { method: 'POST' });
-    await renderJobDetail(name);
-  });
-  detail.querySelectorAll('.build-row').forEach(el => {
-    el.addEventListener('click', () => selectBuild(parseInt(el.dataset.build, 10)));
-  });
+/* ---------- theme ---------- */
+function applyTheme(t){
+  document.documentElement.setAttribute('data-theme', t);
+  document.getElementById('theme-icon').textContent = t === 'dark' ? '☀' : '☾';
+  localStorage.setItem('rc-theme', t);
 }
-
-function duration(started, finished) {
-  if (!started) return '-';
-  const end = finished ? new Date(finished) : new Date();
-  const sec = Math.round((end - new Date(started)) / 1000);
-  return `${sec}s`;
+function toggleTheme(){
+  const cur = document.documentElement.getAttribute('data-theme');
+  applyTheme(cur === 'dark' ? 'light' : 'dark');
 }
+(function initTheme(){
+  const saved = localStorage.getItem('rc-theme');
+  const preferred = saved || (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+  applyTheme(preferred);
+})();
 
-async function selectBuild(id) {
-  state.selectedBuild = id;
-  if (state.logSource) { state.logSource.close(); state.logSource = null; }
-
-  const build = await api(`/api/builds/${id}`);
-  const container = document.getElementById('build-detail');
-  container.innerHTML = `
-    <h3>Build #${build.number} ${badge(build.status)}</h3>
-    <div class="steps">
-      ${build.steps.map(s => `
-        <div class="step">
-          <span>${s.name}${s.post ? ` <span class="muted">(post:${s.post})</span>` : ''}</span>
-          ${badge(s.status)}
-        </div>
-        ${s.error ? `<div class="muted" style="margin:-4px 0 8px 12px">${escapeHtml(s.error)}</div>` : ''}
-      `).join('') || '<p class="muted">ステージ情報なし</p>'}
-    </div>
-    <div id="log">(ログ読み込み中...)</div>
-  `;
-
-  const logEl = document.getElementById('log');
-  logEl.textContent = '';
-  const es = new EventSource(`/api/builds/${id}/log/stream`);
-  state.logSource = es;
-  es.onmessage = (ev) => {
-    logEl.textContent += JSON.parse(ev.data);
-    logEl.scrollTop = logEl.scrollHeight;
-  };
-  es.onerror = () => { es.close(); };
-}
-
-function escapeHtml(s) {
-  return s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-}
-
-function connectGlobalEvents() {
-  const es = new EventSource('/api/events');
-  const status = document.getElementById('conn-status');
-  es.onopen = () => status.textContent = '● connected';
-  es.onerror = () => status.textContent = '○ disconnected';
-  es.onmessage = async (ev) => {
-    const msg = JSON.parse(ev.data);
-    if (state.selectedJob) await renderJobDetail(state.selectedJob);
-    else await loadJobs();
-    if (state.selectedBuild === msg.buildId && msg.type !== 'stage-start') {
-      // refresh build detail (steps/status) without restarting the log stream
-      const build = await api(`/api/builds/${msg.buildId}`);
-      const stepsEl = document.querySelector('#build-detail .steps');
-      if (stepsEl) {
-        stepsEl.innerHTML = build.steps.map(s => `
-          <div class="step">
-            <span>${s.name}${s.post ? ` <span class="muted">(post:${s.post})</span>` : ''}</span>
-            ${badge(s.status)}
-          </div>
-          ${s.error ? `<div class="muted" style="margin:-4px 0 8px 12px">${escapeHtml(s.error)}</div>` : ''}
-        `).join('') || '<p class="muted">ステージ情報なし</p>';
-      }
+/* ---------- router ---------- */
+const routes = [];
+function route(pattern, handler){ routes.push({re: new RegExp('^'+pattern.replace(/:[^/]+/g, '([^/]+)')+'$'), keys: (pattern.match(/:[^/]+/g)||[]).map(k=>k.slice(1)), handler}); }
+function navigate(path){ location.hash = '#'+path; }
+function currentPath(){ return (location.hash || '#/jobs').slice(1); }
+async function renderRoute(){
+  const path = currentPath();
+  for (const r of routes) {
+    const m = path.match(r.re);
+    if (m) {
+      const params = {};
+      r.keys.forEach((k,i) => params[k] = decodeURIComponent(m[i+1]));
+      updateNavHighlight(path);
+      try { await r.handler(params); }
+      catch (e) { document.getElementById('main').innerHTML = `<div class="page"><div class="emptystate">Failed to load: ${esc(e.message)}</div></div>`; }
+      return;
     }
+  }
+  navigate('/jobs');
+}
+window.addEventListener('hashchange', renderRoute);
+
+function updateNavHighlight(path){
+  document.querySelectorAll('.navitem').forEach(el => el.classList.remove('active'));
+  const id = path.startsWith('/queue') ? 'queue' : 'jobs';
+  const el = document.querySelector(`.navitem[data-nav="${id}"]`);
+  if (el) el.classList.add('active');
+  document.getElementById('search-wrap').style.display = path === '/jobs' ? 'flex' : 'none';
+}
+
+/* ---------- search (jobs list only) ---------- */
+let searchTerm = '';
+function onSearch(v){ searchTerm = v.toLowerCase(); if (currentPath() === '/jobs') renderJobsList(); }
+
+/* ---------- sidebar runner status ---------- */
+async function refreshStatus(){
+  try {
+    const s = await api('/api/status');
+    document.getElementById('rb-executors').textContent = `${s.activeExecutors} / ${s.executors}`;
+    document.getElementById('rb-bar').style.width = Math.min(100, (s.activeExecutors / Math.max(1,s.executors)) * 100) + '%';
+    document.getElementById('rb-health').textContent = `healthy · :${s.port}`;
+    const runningBadge = document.getElementById('nav-running-badge');
+    if (s.activeExecutors > 0) { runningBadge.style.display=''; runningBadge.textContent = s.activeExecutors+' active'; }
+    else runningBadge.style.display = 'none';
+    const queueBadge = document.getElementById('nav-queue-badge');
+    if (s.queueLength > 0) { queueBadge.style.display=''; queueBadge.textContent = s.queueLength; }
+    else queueBadge.style.display = 'none';
+  } catch (e) { /* status is best-effort */ }
+}
+
+/* ================= JOBS ================= */
+route('/jobs', renderJobsList);
+async function renderJobsList(){
+  const main = document.getElementById('main');
+  const jobs = await api('/api/jobs');
+  const filtered = searchTerm ? jobs.filter(j => j.name.toLowerCase().includes(searchTerm)) : jobs;
+
+  const running = jobs.filter(j => j.latestBuild && j.latestBuild.status === 'running').length;
+  const success = jobs.filter(j => j.latestBuild && j.latestBuild.status === 'success').length;
+  const failed = jobs.filter(j => j.latestBuild && j.latestBuild.status === 'failed').length;
+  const status = await api('/api/status').catch(()=>({queueLength:0}));
+
+  const stats = [
+    {label:'Success', value:success, sub:'last build', color:'var(--st-success)'},
+    {label:'Running', value:running, sub:'now', color:'var(--st-running)'},
+    {label:'Failed', value:failed, sub:'needs attention', color:'var(--st-failed)'},
+    {label:'Queued', value:status.queueLength||0, sub:'waiting', color:'var(--st-queued)'},
+  ];
+
+  main.innerHTML = `
+  <div class="page fade">
+    <div class="pagehead">
+      <div><h1 class="display">Jobs</h1><p class="sub">${jobs.length} jobs · ${running} running</p></div>
+    </div>
+    <div class="statgrid">
+      ${stats.map(s=>`
+        <div class="statcard">
+          <div class="lbl"><span class="dot" style="background:${s.color}"></span>${s.label}</div>
+          <div class="val display">${s.value}</div>
+          <div class="sub mono">${s.sub}</div>
+        </div>`).join('')}
+    </div>
+    <div class="card">
+      <div class="thead" style="grid-template-columns:1.7fr 1fr 150px 90px"><div>Job</div><div>Last build</div><div>History</div><div style="text-align:right">Run</div></div>
+      <div id="jobs-rows"></div>
+    </div>
+  </div>`;
+
+  const rowsEl = document.getElementById('jobs-rows');
+  if (filtered.length === 0) {
+    rowsEl.innerHTML = `<div style="padding:16px" class="sub">${jobs.length===0 ? 'No jobs found. Drop a pipeline.cipipe into jobs/&lt;name&gt;/ and restart.' : 'No jobs match “'+esc(searchTerm)+'”.'}</div>`;
+    return;
+  }
+  rowsEl.innerHTML = filtered.map(job => {
+    const lb = job.latestBuild;
+    const m = meta(lb && lb.status);
+    const spark = job.recentBuilds.slice().reverse().map(b => {
+      const bm = meta(b.status);
+      const h = b.status === 'running' ? 100 : 55 + (b.number * 13 % 40);
+      return `<span title="#${b.number} · ${b.status}" style="height:${h}%;background:${bm.color};opacity:${b.status==='aborted'?.55:1}"></span>`;
+    }).join('');
+    return `
+    <div class="trow clickable" style="grid-template-columns:1.7fr 1fr 150px 90px" onclick="navigate('/jobs/${encodeURIComponent(job.name)}')">
+      <div style="display:flex;align-items:center;gap:11px;min-width:0">
+        <span style="width:9px;height:9px;border-radius:50%;background:${m.color};flex-shrink:0" class="${m.anim}"></span>
+        <div style="min-width:0">
+          <div style="font-weight:600;font-size:13.5px;display:flex;align-items:center;gap:7px">${esc(job.name)}
+            <span class="mono" style="font-size:9px;padding:1px 5px;border-radius:4px;background:var(--surface-3);color:var(--text-3);text-transform:uppercase">${esc(job.pipelineSource)}</span>
+          </div>
+          <div class="mono" style="font-size:10.5px;color:var(--text-3)">${esc(job.repoUrl || 'no repository')}</div>
+        </div>
+      </div>
+      <div>
+        ${lb ? statusBadge(lb.status) : `<span class="sub">no builds</span>`}
+        ${lb ? `<div class="mono" style="font-size:10.5px;color:var(--text-3);margin-top:4px">#${lb.number} · ${fmtDuration(lb.startedAt, lb.finishedAt)} · ${fmtRelative(lb.queuedAt)}</div>` : ''}
+      </div>
+      <div class="sparkline">${spark || '<span class="sub" style="height:2px;background:var(--border)"></span>'}</div>
+      <div style="text-align:right">
+        <button class="iconbtn" title="Run now" onclick="event.stopPropagation(); triggerJob('${esc(job.name)}')" style="width:30px;height:30px">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+        </button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function triggerJob(name){
+  await api(`/api/jobs/${encodeURIComponent(name)}/trigger`, {method:'POST'});
+  if (currentPath() === '/jobs') renderJobsList();
+  else if (currentPath() === '/jobs/'+encodeURIComponent(name)) renderJobHistory({name});
+}
+
+/* ================= JOB HISTORY ================= */
+route('/jobs/:name', renderJobHistory);
+async function renderJobHistory(params){
+  const main = document.getElementById('main');
+  const name = params.name;
+  const [jobs, builds] = await Promise.all([api('/api/jobs'), api(`/api/jobs/${encodeURIComponent(name)}/builds`)]);
+  const job = jobs.find(j => j.name === name);
+  if (!job) { main.innerHTML = `<div class="page"><div class="emptystate">Job “${esc(name)}” not found.</div></div>`; return; }
+
+  const m = meta(job.latestBuild && job.latestBuild.status);
+  main.innerHTML = `
+  <div class="page fade">
+    <div class="crumb"><span class="link" onclick="navigate('/jobs')">jobs</span> / <span>${esc(name)}</span></div>
+    <div class="pagehead">
+      <div>
+        <h1 class="display" style="display:flex;align-items:center;gap:10px"><span style="width:10px;height:10px;border-radius:50%;background:${m.color}" class="${m.anim}"></span>${esc(name)}</h1>
+        <div class="mono sub" style="display:flex;gap:16px;flex-wrap:wrap">
+          <span>${esc(job.repoUrl || 'no repository')}</span><span>pipeline: ${esc(job.pipelineSource)}</span>
+        </div>
+      </div>
+      <button class="btn primary" onclick="triggerJob('${esc(name)}')">Run now</button>
+    </div>
+    <div class="card">
+      <div class="thead" style="grid-template-columns:64px 118px 1fr 100px 90px"><div>Build</div><div>Status</div><div>Note</div><div>Duration</div><div style="text-align:right">When</div></div>
+      <div id="history-rows"></div>
+    </div>
+  </div>`;
+
+  const rowsEl = document.getElementById('history-rows');
+  if (builds.length === 0) { rowsEl.innerHTML = `<div style="padding:16px" class="sub">No builds yet.</div>`; return; }
+  rowsEl.innerHTML = builds.map(b => `
+    <div class="trow clickable" style="grid-template-columns:64px 118px 1fr 100px 90px" onclick="navigate('/builds/${b.id}')">
+      <div class="mono" style="font-weight:600">#${b.number}</div>
+      <div>${statusBadge(b.status)}</div>
+      <div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(b.note || '')} <span class="sub mono">${esc(b.trigger)}</span></div>
+      <div class="mono">${fmtDuration(b.startedAt, b.finishedAt)}</div>
+      <div class="mono sub" style="text-align:right">${fmtRelative(b.queuedAt)}</div>
+    </div>`).join('');
+}
+
+/* ================= BUILD DETAIL ================= */
+route('/builds/:id', renderBuildDetail);
+let currentBuildId = null;
+let expandedSteps = {};
+let logSource = null;
+
+async function renderBuildDetail(params){
+  currentBuildId = Number(params.id);
+  expandedSteps = {};
+  await refreshBuildDetail(true);
+}
+
+async function refreshBuildDetail(scaffold){
+  if (currentPath() !== '/builds/'+currentBuildId) return;
+  const main = document.getElementById('main');
+  let build;
+  try { build = await api(`/api/builds/${currentBuildId}`); }
+  catch (e) { main.innerHTML = `<div class="page"><div class="emptystate">Build not found.</div></div>`; return; }
+
+  const m = meta(build.status);
+  const total = build.steps.reduce((a,s)=>a + Math.max(1, (new Date(s.finishedAt||Date.now()) - new Date(s.startedAt||Date.now()))/1000), 0) || 1;
+  const gantt = build.steps.map(s => {
+    const secs = Math.max(1, (new Date(s.finishedAt||Date.now()) - new Date(s.startedAt||Date.now()))/1000);
+    const sm = meta(s.status === 'running' ? 'running' : (s.status === 'failed' ? 'failed' : (s.status === 'success' ? 'success' : 'aborted')));
+    return `<span title="${esc(s.name)}" style="width:${Math.max(2,(secs/total)*100)}%;background:${sm.color}" class="${sm.anim}"></span>`;
+  }).join('');
+
+  if (scaffold) {
+    main.innerHTML = `
+    <div class="page fade" style="max-width:1180px">
+      <div class="crumb"><span class="link" onclick="navigate('/jobs')">jobs</span> / <span class="link" onclick="navigate('/jobs/${encodeURIComponent(build.jobName)}')">${esc(build.jobName)}</span> / <span>#${build.number}</span></div>
+      <div class="buildhead" id="build-header"></div>
+      <div id="build-steps"></div>
+      <div class="hint" style="margin-top:4px">Test results and artifact downloads arrive with a later milestone (F4 in the spec).</div>
+    </div>`;
+  }
+
+  document.getElementById('build-header').innerHTML = `
+    <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap">
+      <div>
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:9px">
+          ${statusBadge(build.status)}
+          <h1 class="display" style="font-size:21px;margin:0">${esc(build.jobName)} <span class="sub">#${build.number}</span></h1>
+        </div>
+        <div class="mono sub" style="display:flex;gap:16px;flex-wrap:wrap">
+          <span><span style="color:var(--text-3)">trigger</span> ${esc(build.trigger)}</span>
+          <span><span style="color:var(--text-3)">queued</span> ${fmtTime(build.queuedAt)}</span>
+          <span><span style="color:var(--text-3)">duration</span> ${fmtDuration(build.startedAt, build.finishedAt)}</span>
+        </div>
+        ${build.note ? `<div style="margin-top:9px;display:inline-flex;align-items:center;gap:7px;font-size:12px;color:var(--text-2);background:var(--surface-2);border:1px solid var(--border);padding:4px 10px;border-radius:6px"><span style="color:var(--st-running)">&#10022;</span>${esc(build.note)}</div>` : ''}
+      </div>
+      <div style="display:flex;gap:8px">
+        <button class="btn" onclick="rebuildBuild(${build.id})">Rebuild</button>
+        ${build.status==='running' || build.status==='queued' ? `<button class="btn danger" onclick="abortBuild(${build.id})">Abort</button>` : ''}
+      </div>
+    </div>
+    <div class="gantt">${gantt}</div>`;
+
+  // A running step always auto-expands; mark that before rendering so its log container exists.
+  build.steps.forEach(s => { if (s.status === 'running') expandedSteps[s.seq] = true; });
+
+  document.getElementById('build-steps').innerHTML = build.steps.length === 0
+    ? `<div class="emptystate">${build.status==='queued' ? 'Waiting to start…' : 'No steps recorded.'}</div>`
+    : build.steps.map(s => renderStep(s, build.status)).join('');
+
+  // Wire up live log streams for expanded steps. Re-rendering here (triggered by real
+  // stage-start/stage-end/build-finished events over the global SSE feed, not a fixed-interval
+  // poll) keeps this from tearing down an in-flight EventSource's DOM node every couple of
+  // seconds while a step is still streaming.
+  build.steps.forEach(s => {
+    if (expandedSteps[s.seq]) loadStepLog(build, s);
+  });
+}
+
+function renderStep(s, buildStatus){
+  const sm = meta(s.status === 'running' ? 'running' : (s.status === 'failed' ? 'failed' : (s.status === 'success' ? 'success' : 'aborted')));
+  const isExpanded = !!expandedSteps[s.seq];
+  const borderColor = s.status === 'running' ? 'var(--st-running)' : (s.status === 'failed' ? 'var(--st-failed)' : 'var(--border)');
+  return `
+    <div class="step" style="border-color:${borderColor}">
+      <div class="stephead" onclick="toggleStep(${s.seq})">
+        <span class="stepicon ${s.status==='running'?'spin':''}" style="background:${sm.soft};color:${sm.color}">${s.status==='running' ? '&#8635;' : sm.icon}</span>
+        <div style="display:flex;align-items:center;gap:9px;min-width:0">
+          <span class="mono" style="font-size:11px;color:var(--text-3)">${String(s.seq).padStart(2,'0')}</span>
+          <span style="font-weight:600;font-size:13.5px">${esc(s.name)}</span>
+          ${s.post ? `<span class="mono" style="font-size:9px;padding:1px 6px;border-radius:4px;background:var(--surface-3);color:var(--text-3);text-transform:uppercase">post · ${esc(s.post)}</span>` : ''}
+        </div>
+        <span class="mono" style="color:var(--text-2)">${fmtDuration(s.startedAt, s.finishedAt)}</span>
+        <span style="color:var(--text-3);font-size:12px;transform:rotate(${isExpanded?90:0}deg);transition:transform .15s;display:inline-block">&#9656;</span>
+      </div>
+      ${isExpanded ? `<div class="steplog" id="steplog-${s.seq}"><div class="sub" style="padding:8px 14px">Loading…</div></div>` : ''}
+      ${s.error ? `<div style="margin:0 14px 12px;padding:9px 12px;background:var(--st-failed-soft);border-radius:7px;font-family:ui-monospace,monospace;font-size:11px;color:var(--st-failed);white-space:pre-wrap">${esc(s.error)}</div>` : ''}
+    </div>`;
+}
+
+function toggleStep(seq){
+  expandedSteps[seq] = !expandedSteps[seq];
+  refreshBuildDetail(true);
+}
+
+function parseLogLine(line){
+  const m = line.match(/^\[(\d{2}:\d{2}:\d{2}\.\d{3})\]\s?(.*)$/s);
+  return m ? {t:m[1], text:m[2]} : {t:'', text:line};
+}
+
+async function loadStepLog(build, step){
+  const el = document.getElementById(`steplog-${step.seq}`);
+  if (!el) return;
+  const isLiveBuild = build.status === 'running';
+  const url = `/api/builds/${build.id}/log/stream`;
+
+  if (!isLiveBuild || step.status !== 'running') {
+    // Completed step (or completed build): fetch full/static log once and slice by offset.
+    try {
+      const full = await fetch(url).then(r => r.text());
+      const start = step.logOffsetStart ?? 0;
+      const end = step.logOffsetEnd ?? full.length;
+      const slice = full.slice(start, end).split('\n').filter(Boolean);
+      el.innerHTML = slice.map(l => { const p = parseLogLine(l); return `<div class="logline"><span class="t">${esc(p.t)}</span><span class="m">${esc(p.text)}</span></div>`; }).join('') || '<div class="sub" style="padding:8px 14px">(no output)</div>';
+      el.scrollTop = el.scrollHeight;
+    } catch (e) { el.innerHTML = `<div class="sub" style="padding:8px 14px">Failed to load log.</div>`; }
+    return;
+  }
+
+  // Running step on a running build: stream live via SSE. The stream is per-build (not
+  // per-step), so the very first message (backlog) is sliced at this step's known start
+  // offset to approximate a step-scoped view; later messages are new content and used as-is.
+  el.innerHTML = '';
+  if (logSource) { logSource.close(); }
+  logSource = new EventSource(url);
+  let firstMessage = true;
+  logSource.onmessage = (ev) => {
+    let text = JSON.parse(ev.data);
+    if (firstMessage) {
+      firstMessage = false;
+      // The offset was computed server-side at some earlier poll tick and can end up past the
+      // backlog length actually delivered at subscribe time (control-file tailing and the
+      // stdout pump race independently - see ci-runner-dsl-spec.md §4.3). Slicing past the end
+      // of a string silently yields "", which would permanently blank the log; only trim when
+      // the offset actually falls within what we received.
+      const cut = step.logOffsetStart ?? 0;
+      if (cut > 0 && cut < text.length) text = text.slice(cut);
+    }
+    text.split('\n').filter(Boolean).forEach(line => {
+      const p = parseLogLine(line);
+      const div = document.createElement('div');
+      div.className = 'logline';
+      div.innerHTML = `<span class="t">${esc(p.t)}</span><span class="m">${esc(p.text)}</span>`;
+      el.appendChild(div);
+    });
+    el.scrollTop = el.scrollHeight;
+  };
+  logSource.onerror = async () => {
+    // A transient error can happen right after the build starts (the log hub may not have
+    // opened the file yet) - let EventSource's built-in auto-reconnect handle that rather than
+    // closing permanently. Only tear down once the build has actually finished, falling back
+    // to the static/sliced view for this step.
+    if (!logSource) return;
+    try {
+      const freshBuild = await api(`/api/builds/${build.id}`);
+      if (freshBuild.status !== 'running') {
+        logSource.close();
+        logSource = null;
+        const freshStep = freshBuild.steps.find(x => x.seq === step.seq);
+        if (freshStep) loadStepLog(freshBuild, freshStep);
+      }
+    } catch (e) { /* transient - EventSource will keep retrying */ }
   };
 }
 
-loadJobs();
+async function rebuildBuild(id){
+  // M1 has no dedicated rebuild endpoint yet; manual re-trigger of the same job is the workaround.
+  const build = await api(`/api/builds/${id}`);
+  await triggerJob(build.jobName);
+  navigate('/jobs/'+encodeURIComponent(build.jobName));
+}
+async function abortBuild(id){
+  alert('Abort is not implemented yet (planned alongside timeout/Job-Object process-tree kill in a later milestone).');
+}
+
+/* ================= QUEUE ================= */
+route('/queue', renderQueue);
+async function renderQueue(){
+  const main = document.getElementById('main');
+  const queue = await api('/api/queue');
+  main.innerHTML = `
+  <div class="page fade" style="max-width:960px">
+    <h1 class="display">Queue</h1>
+    <p class="sub" style="margin-bottom:20px">${queue.length} build${queue.length===1?'':'s'} waiting</p>
+    <div id="queue-rows"></div>
+  </div>`;
+  const rowsEl = document.getElementById('queue-rows');
+  if (queue.length === 0) { rowsEl.innerHTML = `<div class="emptystate">Queue is empty.</div>`; return; }
+  rowsEl.innerHTML = `<div style="display:flex;flex-direction:column;gap:8px">` + queue.map(q => {
+    const m = meta(q.status);
+    return `
+    <div style="display:flex;align-items:center;gap:14px;padding:13px 16px;background:var(--surface);border:1px solid var(--border);border-radius:10px;box-shadow:var(--shadow)">
+      <span class="mono" style="width:26px;height:26px;border-radius:8px;background:${m.soft};color:${m.color};display:flex;align-items:center;justify-content:center;font-weight:600;font-size:12px">${q.position}</span>
+      <div style="flex:1;min-width:0">
+        <div style="font-weight:600;font-size:13.5px;display:flex;align-items:center;gap:8px">${esc(q.jobName)} <span class="mono sub">#${q.number}</span></div>
+        <div class="mono sub" style="font-size:11px">${esc(q.trigger)} · queued ${fmtRelative(q.queuedAt)}</div>
+      </div>
+      ${statusBadge(q.status)}
+    </div>`;
+  }).join('') + `</div>`;
+}
+
+/* ---------- global SSE: keep current view fresh ---------- */
+function connectGlobalEvents(){
+  const es = new EventSource('/api/events');
+  es.onmessage = () => {
+    refreshStatus();
+    const path = currentPath();
+    if (path === '/jobs') renderJobsList();
+    else if (path.startsWith('/jobs/')) renderJobHistory({name: decodeURIComponent(path.slice(6))});
+    else if (path.startsWith('/builds/')) refreshBuildDetail(false);
+    else if (path === '/queue') renderQueue();
+  };
+}
+
+/* ---------- boot ---------- */
+refreshStatus();
+setInterval(refreshStatus, 5000);
+renderRoute();
 connectGlobalEvents();
-setInterval(() => { if (!state.selectedJob) loadJobs(); }, 5000);
 </script>
 </body>
 </html>

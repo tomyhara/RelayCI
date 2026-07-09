@@ -81,6 +81,15 @@ public sealed class BuildRepository
         return result;
     }
 
+    public int CountByStatus(string status)
+    {
+        using var conn = _db.OpenConnection();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT COUNT(*) FROM builds WHERE status = $status";
+        cmd.Parameters.AddWithValue("$status", status);
+        return Convert.ToInt32(cmd.ExecuteScalar());
+    }
+
     public List<BuildRecord> ListQueued()
     {
         using var conn = _db.OpenConnection();

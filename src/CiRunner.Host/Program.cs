@@ -54,9 +54,43 @@ app.MapGet("/api/jobs", (JobRepository jobRepo, BuildRepository buildRepo) =>
     {
         j.Name,
         j.Enabled,
+        j.RepoUrl,
+        j.PipelineSource,
         LatestBuild = MapBuildSummary(buildRepo.FindLatestByJob(j.Id)),
+        RecentBuilds = buildRepo.ListByJob(j.Id, 10).Select(b => new { b.Number, b.Status }),
     });
     return Results.Ok(jobs);
+});
+
+app.MapGet("/api/queue", (BuildRepository buildRepo, JobRepository jobRepo) =>
+{
+    var queued = buildRepo.ListQueued();
+    var result = queued.Select((b, i) =>
+    {
+        var job = jobRepo.FindById(b.JobId);
+        return new
+        {
+            Position = i + 1,
+            b.Id,
+            JobName = job?.Name,
+            b.Number,
+            b.Status,
+            b.Trigger,
+            b.QueuedAt,
+        };
+    });
+    return Results.Ok(result);
+});
+
+app.MapGet("/api/status", (SettingsRepository settings, BuildRepository buildRepo, RunnerConfig cfg) =>
+{
+    return Results.Ok(new
+    {
+        Executors = settings.GetInt("executors", 2),
+        ActiveExecutors = buildRepo.CountByStatus(BuildStatus.Running),
+        QueueLength = buildRepo.CountByStatus(BuildStatus.Queued) + buildRepo.CountByStatus(BuildStatus.Waiting),
+        Port = cfg.Port,
+    });
 });
 
 app.MapGet("/api/jobs/{name}/builds", (string name, JobRepository jobRepo, BuildRepository buildRepo) =>
