@@ -118,4 +118,59 @@ public class JobTriggerServiceTests
         Assert.False(result.Queued);
         Assert.Contains("Required1", result.Reason);
     }
+
+    // PRM-003: Rebuild re-queues the same job with the same parameters and (for repo jobs) the same
+    // commit/branch, tagged trigger=rebuild.
+    [Fact]
+    public void Rebuild_UnknownBuild_ReturnsNotQueued()
+    {
+        using var fx = new EngineFixture();
+        var result = fx.TriggerService.Rebuild(999);
+        Assert.False(result.Queued);
+        Assert.Equal("build-not-found", result.Reason);
+    }
+
+    [Fact]
+    public void Rebuild_SameParametersAndCommit_QueuesNewBuildTaggedRebuild()
+    {
+        using var fx = new EngineFixture();
+        fx.CreateJob("j", "Stage \"A\" { Write-Host 1 }");
+        fx.Jobs.UpsertConfiguredJob(new JobConfigInput(
+            Name: "j", RepoUrl: "https://example.invalid/repo.git", WorkspacePath: null, PipelineSource: "server",
+            PipelinePath: "pipeline.cipipe", ParametersJson: """[{"Name":"Target","Default":"x"}]""",
+            CronSchedulesJson: "[]", PollingBranchesJson: null, ResourcesJson: "[]", QueuePolicy: "queue",
+            TimeoutMinutes: null, Retention: null, ShellPath: null, Enabled: true));
+
+        var original = fx.TriggerService.Trigger("j", BuildTrigger.Manual, new Dictionary<string, string> { ["Target"] = "release" }, dedupKey: null);
+        Assert.True(original.Queued);
+        fx.Builds.SetCommitInfo(original.Build!.Id, "abc123", "main");
+
+        var rebuilt = fx.TriggerService.Rebuild(original.Build.Id);
+
+        Assert.True(rebuilt.Queued);
+        Assert.NotEqual(original.Build.Id, rebuilt.Build!.Id);
+        Assert.Equal(BuildTrigger.Rebuild, rebuilt.Build.Trigger);
+        Assert.Equal("abc123", rebuilt.Build.CommitSha);
+        Assert.Equal("main", rebuilt.Build.Branch);
+        Assert.Equal(fx.Builds.FindById(original.Build.Id)!.Parameters, rebuilt.Build.Parameters);
+    }
+
+    [Fact]
+    public void Rebuild_DisabledJob_ReturnsNotQueued()
+    {
+        using var fx = new EngineFixture();
+        fx.CreateJob("j", "Stage \"A\" { Write-Host 1 }");
+        var original = fx.TriggerService.Trigger("j", BuildTrigger.Manual, null, dedupKey: null);
+        Assert.True(original.Queued);
+
+        fx.Jobs.UpsertConfiguredJob(new JobConfigInput(
+            Name: "j", RepoUrl: null, WorkspacePath: null, PipelineSource: "server", PipelinePath: "pipeline.cipipe",
+            ParametersJson: "[]", CronSchedulesJson: "[]", PollingBranchesJson: null, ResourcesJson: "[]",
+            QueuePolicy: "replace", TimeoutMinutes: null, Retention: null, ShellPath: null, Enabled: false));
+
+        var rebuilt = fx.TriggerService.Rebuild(original.Build!.Id);
+
+        Assert.False(rebuilt.Queued);
+        Assert.Equal("job-not-found-or-disabled", rebuilt.Reason);
+    }
 }

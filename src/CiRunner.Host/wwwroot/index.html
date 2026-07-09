@@ -608,8 +608,8 @@ async function refreshBuildDetail(scaffold){
         ${build.note ? `<div style="margin-top:9px;display:inline-flex;align-items:center;gap:7px;font-size:12px;color:var(--text-2);background:var(--surface-2);border:1px solid var(--border);padding:4px 10px;border-radius:6px"><span style="color:var(--st-running)">&#10022;</span>${esc(build.note)}</div>` : ''}
       </div>
       <div style="display:flex;gap:8px">
-        ${canOperate() ? `<button class="btn" onclick="rebuildBuild(${build.id})">Rebuild</button>` : ''}
-        ${canOperate() && (build.status==='running' || build.status==='queued') ? `<button class="btn danger" onclick="abortBuild(${build.id})">Abort</button>` : ''}
+        ${canOperate() ? `<button class="btn" data-testid="rebuild-btn" onclick="rebuildBuild(${build.id})">Rebuild</button>` : ''}
+        ${canOperate() && (build.status==='running' || build.status==='queued' || build.status==='waiting') ? `<button class="btn danger" data-testid="abort-btn" onclick="abortBuild(${build.id})">Abort</button>` : ''}
       </div>
     </div>
     <div class="gantt">${gantt}</div>`;
@@ -814,13 +814,21 @@ async function loadStepLog(build, step){
 }
 
 async function rebuildBuild(id){
-  // M1 has no dedicated rebuild endpoint yet; manual re-trigger of the same job is the workaround.
-  const build = await api(`/api/builds/${id}`);
-  await triggerJob(build.jobName);
-  navigate('/jobs/'+encodeURIComponent(build.jobName));
+  try {
+    const build = await api(`/api/builds/${id}/rebuild`, {method:'POST'});
+    navigate('/builds/'+build.id);
+  } catch (e) {
+    alert('Rebuild failed: ' + e.message);
+  }
 }
 async function abortBuild(id){
-  alert('Abort is not implemented yet (planned alongside timeout/Job-Object process-tree kill in a later milestone).');
+  if (!confirm('Abort this build?')) return;
+  try {
+    await api(`/api/builds/${id}/abort`, {method:'POST'});
+    if (currentPath() === '/builds/'+id) renderBuildDetail({id});
+  } catch (e) {
+    alert('Abort failed: ' + e.message);
+  }
 }
 
 /* ================= QUEUE ================= */

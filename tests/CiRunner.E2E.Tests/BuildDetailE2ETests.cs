@@ -128,4 +128,46 @@ public class BuildDetailE2ETests : IAsyncLifetime
         var downloaded = await host.Client.GetStringAsync(href);
         Assert.Equal(artifactContent, downloaded);
     }
+
+    // E2E-008: the Abort button on a running build's detail page marks it Aborted and the UI reflects
+    // the status change without a manual page reload (driven by the SSE build-finished event).
+    [Fact]
+    public async Task AbortButton_StopsRunningBuild_E2E008()
+    {
+        await using var host = await HostProcess.StartAsync(new[] { Admin }, initialAdmins: new[] { "admin" });
+        var buildId = await CreateAndTriggerJobAsync(host, "abort-btn-job", """
+            Stage "Work" { Start-Sleep -Seconds 30 }
+            """);
+
+        var page = await LoggedInPageAsync(host, _pw.Browser);
+        await page.GotoAsync(host.BaseUrl + $"#/builds/{buildId}");
+
+        var abortBtn = page.Locator("[data-testid=abort-btn]");
+        await Expect(abortBtn).ToBeVisibleAsync(new() { Timeout = 15000 });
+        page.Dialog += (_, dialog) => dialog.AcceptAsync();
+        await abortBtn.ClickAsync();
+
+        await Expect(page.Locator(".badge-status", new() { HasTextString = "Aborted" })).ToBeVisibleAsync(new() { Timeout = 15000 });
+    }
+
+    // E2E-009: Rebuild queues a new build for the same job/SHA, tagged trigger=rebuild, and the UI
+    // navigates to the new build's own detail page.
+    [Fact]
+    public async Task RebuildButton_QueuesNewBuildWithRebuildTrigger_E2E009()
+    {
+        await using var host = await HostProcess.StartAsync(new[] { Admin }, initialAdmins: new[] { "admin" });
+        var buildId = await CreateAndTriggerJobAsync(host, "rebuild-btn-job", """
+            Stage "Work" { Write-Host "done" }
+            """);
+
+        var page = await LoggedInPageAsync(host, _pw.Browser);
+        await page.GotoAsync(host.BaseUrl + $"#/builds/{buildId}");
+
+        var rebuildBtn = page.Locator("[data-testid=rebuild-btn]");
+        await Expect(rebuildBtn).ToBeVisibleAsync(new() { Timeout = 15000 });
+        await rebuildBtn.ClickAsync();
+
+        await Expect(page).ToHaveURLAsync(new System.Text.RegularExpressions.Regex(@"#/builds/(?!" + buildId + @"$)\d+$"), new() { Timeout = 15000 });
+        await Expect(page.Locator(".mono.sub").First).ToContainTextAsync("rebuild", new() { Timeout = 15000 });
+    }
 }

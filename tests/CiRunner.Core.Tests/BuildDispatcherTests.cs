@@ -235,6 +235,94 @@ public class BuildDispatcherTests
         }
     }
 
+    // F3/F5: manual UI Abort of a Running build kills the process tree and marks it Aborted through
+    // the same mechanism as a timeout (ci-runner-test-spec.md §3.1 ENG-021).
+    [Fact]
+    public async Task Dispatcher_AbortRunningBuild_KillsProcessAndMarksAborted_ENG021()
+    {
+        using var fx = new EngineFixture();
+        var job = fx.CreateJob("abort-running", """Stage "Work" { Start-Sleep -Seconds 30 }""");
+        var dispatcher = new BuildDispatcher(fx.Builds, fx.Jobs, fx.Runner, fx.EventHub, executorLimit: 1);
+        await dispatcher.StartAsync(CancellationToken.None);
+        try
+        {
+            var build = fx.Builds.CreateQueued(job.Id, BuildTrigger.Manual, "{}", null);
+            dispatcher.Signal();
+            await WaitUntilRunningAsync(fx, build.Id, TimeSpan.FromSeconds(10));
+
+            var outcome = dispatcher.Abort(build.Id);
+            Assert.Equal(BuildDispatcher.AbortOutcome.Aborted, outcome);
+
+            await WaitUntilTerminalAsync(fx, build.Id, TimeSpan.FromSeconds(10));
+            Assert.Equal(BuildStatus.Aborted, fx.Builds.FindById(build.Id)!.Status);
+        }
+        finally
+        {
+            await dispatcher.StopAsync(CancellationToken.None);
+        }
+    }
+
+    // A Queued build has no process to kill yet, so Abort closes it out directly without ever running it.
+    [Fact]
+    public async Task Dispatcher_AbortQueuedBuild_ClosesItOutWithoutRunning()
+    {
+        using var fx = new EngineFixture();
+        var blocker = fx.CreateJob("abort-queued-blocker", """Stage "Work" { Start-Sleep -Seconds 30 }""");
+        var target = fx.CreateJob("abort-queued-target", """Stage "Work" { Start-Sleep -Milliseconds 200 }""");
+        var dispatcher = new BuildDispatcher(fx.Builds, fx.Jobs, fx.Runner, fx.EventHub, executorLimit: 1);
+        await dispatcher.StartAsync(CancellationToken.None);
+        try
+        {
+            var running = fx.Builds.CreateQueued(blocker.Id, BuildTrigger.Manual, "{}", null);
+            dispatcher.Signal();
+            await WaitUntilRunningAsync(fx, running.Id, TimeSpan.FromSeconds(10));
+
+            var queued = fx.Builds.CreateQueued(target.Id, BuildTrigger.Manual, "{}", null);
+            dispatcher.Signal();
+            await Task.Delay(200);
+            Assert.Equal(BuildStatus.Queued, fx.Builds.FindById(queued.Id)!.Status);
+
+            var outcome = dispatcher.Abort(queued.Id);
+            Assert.Equal(BuildDispatcher.AbortOutcome.Aborted, outcome);
+            Assert.Equal(BuildStatus.Aborted, fx.Builds.FindById(queued.Id)!.Status);
+
+            dispatcher.Abort(running.Id);
+        }
+        finally
+        {
+            await dispatcher.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public void Dispatcher_AbortUnknownBuild_ReturnsNotFound()
+    {
+        using var fx = new EngineFixture();
+        var dispatcher = new BuildDispatcher(fx.Builds, fx.Jobs, fx.Runner, fx.EventHub);
+        Assert.Equal(BuildDispatcher.AbortOutcome.NotFound, dispatcher.Abort(999));
+    }
+
+    [Fact]
+    public async Task Dispatcher_AbortAlreadyFinishedBuild_ReturnsAlreadyTerminal()
+    {
+        using var fx = new EngineFixture();
+        var job = fx.CreateJob("abort-finished", """Stage "Work" { Write-Host "done" }""");
+        var dispatcher = new BuildDispatcher(fx.Builds, fx.Jobs, fx.Runner, fx.EventHub, executorLimit: 1);
+        await dispatcher.StartAsync(CancellationToken.None);
+        try
+        {
+            var build = fx.Builds.CreateQueued(job.Id, BuildTrigger.Manual, "{}", null);
+            dispatcher.Signal();
+            await WaitUntilTerminalAsync(fx, build.Id, TimeSpan.FromSeconds(10));
+
+            Assert.Equal(BuildDispatcher.AbortOutcome.AlreadyTerminal, dispatcher.Abort(build.Id));
+        }
+        finally
+        {
+            await dispatcher.StopAsync(CancellationToken.None);
+        }
+    }
+
     [Fact]
     public async Task Dispatcher_ExecutorOne_TwoDifferentJobs_StillLimitedToOneAtATime()
     {

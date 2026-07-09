@@ -655,6 +655,31 @@ app.MapPost("/api/jobs/{name}/trigger", (string name, TriggerRequest? body, JobT
     return Results.Ok(MapBuildSummary(result.Build));
 }).RequireAuthorization("Operator");
 
+app.MapPost("/api/builds/{id:long}/abort", (long id, BuildDispatcher dispatcher) =>
+{
+    var outcome = dispatcher.Abort(id);
+    return outcome switch
+    {
+        BuildDispatcher.AbortOutcome.NotFound => Results.NotFound(),
+        BuildDispatcher.AbortOutcome.AlreadyTerminal => Results.BadRequest(new { error = "build is not queued, waiting, or running" }),
+        _ => Results.Ok(),
+    };
+}).RequireAuthorization("Operator");
+
+app.MapPost("/api/builds/{id:long}/rebuild", (long id, JobTriggerService triggerService) =>
+{
+    var result = triggerService.Rebuild(id);
+    if (!result.Queued && result.Reason is "build-not-found" or "job-not-found-or-disabled")
+    {
+        return Results.NotFound();
+    }
+    if (!result.Queued)
+    {
+        return Results.BadRequest(new { error = result.Reason });
+    }
+    return Results.Ok(MapBuildSummary(result.Build));
+}).RequireAuthorization("Operator");
+
 app.MapPost("/api/internal/start-job/{name}", (string name, StartJobRequest? body, JobTriggerService triggerService, HookRunRepository hookRunRepo) =>
 {
     var result = triggerService.Trigger(name, BuildTrigger.Hook, body?.Parameters, body?.DedupKey);

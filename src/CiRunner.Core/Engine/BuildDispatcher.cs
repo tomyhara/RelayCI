@@ -22,8 +22,11 @@ public sealed class BuildDispatcher : BackgroundService
 
     private readonly object _stateLock = new();
     private readonly HashSet<long> _runningJobIds = new();
+    private readonly Dictionary<long, CancellationTokenSource> _buildCts = new();
     private int _activeExecutors;
     private readonly SemaphoreSlim _wake = new(1);
+
+    public enum AbortOutcome { NotFound, AlreadyTerminal, Aborted }
 
     public BuildDispatcher(BuildRepository buildRepo, JobRepository jobRepo, BuildRunner buildRunner, GlobalEventHub eventHub, int executorLimit = 2, RetentionService? retentionService = null, SettingsRepository? settings = null, ResourceLockManager? resourceLocks = null)
     {
@@ -51,6 +54,44 @@ public sealed class BuildDispatcher : BackgroundService
         {
             _wake.Release();
         }
+    }
+
+    /// <summary>
+    /// Manual Abort (spec §5 F3 "手動中断(UI からの Abort)も同機構で実現"). A Running build is cancelled
+    /// through the same CancellationTokenSource the timeout path uses, so BuildRunner kills the process
+    /// tree and marks it Aborted itself. A Queued/Waiting build has no process yet, so it is closed out
+    /// directly here instead.
+    /// </summary>
+    public AbortOutcome Abort(long buildId)
+    {
+        CancellationTokenSource? cts;
+        lock (_stateLock)
+        {
+            _buildCts.TryGetValue(buildId, out cts);
+        }
+        if (cts is not null)
+        {
+            cts.Cancel();
+            return AbortOutcome.Aborted;
+        }
+
+        // Not (yet) picked up by the dispatcher. A build that starts Running in the small window
+        // right after this check just runs to completion normally - acceptable for a manual abort
+        // action, not a build correctness invariant.
+        var build = _buildRepo.FindById(buildId);
+        if (build is null)
+        {
+            return AbortOutcome.NotFound;
+        }
+        if (Models.BuildStatus.IsTerminal(build.Status) || build.Status == Models.BuildStatus.Running)
+        {
+            return AbortOutcome.AlreadyTerminal;
+        }
+
+        _buildRepo.UpdateStatus(buildId, Models.BuildStatus.Aborted, finishedAt: DateTimeOffset.Now.ToString("o"));
+        _eventHub.Publish(JsonSerializer.Serialize(new { buildId, type = "build-finished", payload = new { status = Models.BuildStatus.Aborted } }));
+        Signal();
+        return AbortOutcome.Aborted;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -85,6 +126,7 @@ public sealed class BuildDispatcher : BackgroundService
             }
             var resources = ParseResources(job.Resources);
 
+            CancellationTokenSource buildCts;
             lock (_stateLock)
             {
                 if (_activeExecutors >= CurrentExecutorLimit)
@@ -106,12 +148,14 @@ public sealed class BuildDispatcher : BackgroundService
                 }
                 _activeExecutors++;
                 _runningJobIds.Add(build.JobId);
+                buildCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+                _buildCts[build.Id] = buildCts;
             }
 
             _buildRepo.UpdateStatus(build.Id, Models.BuildStatus.Running, startedAt: DateTimeOffset.Now.ToString("o"));
             _eventHub.Publish(JsonSerializer.Serialize(new { buildId = build.Id, type = "build-started", payload = new { } }));
 
-            _ = RunAndReleaseAsync(job, build, stoppingToken);
+            _ = RunAndReleaseAsync(job, build, buildCts);
         }
     }
 
@@ -127,11 +171,11 @@ public sealed class BuildDispatcher : BackgroundService
         }
     }
 
-    private async Task RunAndReleaseAsync(Models.JobRecord job, Models.BuildRecord build, CancellationToken ct)
+    private async Task RunAndReleaseAsync(Models.JobRecord job, Models.BuildRecord build, CancellationTokenSource buildCts)
     {
         try
         {
-            await _buildRunner.RunAsync(job, build, ct);
+            await _buildRunner.RunAsync(job, build, buildCts.Token);
             _retentionService?.Enforce(job);
         }
         finally
@@ -143,7 +187,9 @@ public sealed class BuildDispatcher : BackgroundService
             {
                 _activeExecutors--;
                 _runningJobIds.Remove(build.JobId);
+                _buildCts.Remove(build.Id);
             }
+            buildCts.Dispose();
             Signal();
         }
     }

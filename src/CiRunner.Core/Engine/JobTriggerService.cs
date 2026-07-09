@@ -1,3 +1,4 @@
+using System.Text.Json;
 using CiRunner.Core.Data;
 using CiRunner.Core.Models;
 
@@ -60,5 +61,41 @@ public sealed class JobTriggerService
         var build = _buildRepo.CreateQueued(job.Id, trigger, resolved.ParametersJson, dedupKey, commitSha, branch);
         _dispatcher.Signal();
         return new TriggerResult(true, build, job.Name, null);
+    }
+
+    /// <summary>
+    /// Re-queues a past build's job with the same parameters and (for repo jobs) the same commit
+    /// (spec §5 F5 "Rebuild ボタン", test spec PRM-003 "元ビルドと同一のパラメータで再実行"). Goes through
+    /// the same Trigger() path as any other trigger source, so DedupKey/queue_policy still apply if a
+    /// caller ever passes one - Rebuild itself never sets one, matching "キーなし投入は常に積まれる".
+    /// </summary>
+    public TriggerResult Rebuild(long buildId)
+    {
+        var original = _buildRepo.FindById(buildId);
+        if (original is null)
+        {
+            return new TriggerResult(false, null, null, "build-not-found");
+        }
+
+        var job = _jobRepo.FindById(original.JobId);
+        if (job is null)
+        {
+            return new TriggerResult(false, null, null, "job-not-found-or-disabled");
+        }
+
+        var parameters = ParseParametersJson(original.Parameters);
+        return Trigger(job.Name, BuildTrigger.Rebuild, parameters, dedupKey: null, commitSha: original.CommitSha, branch: original.Branch);
+    }
+
+    private static Dictionary<string, string> ParseParametersJson(string json)
+    {
+        try
+        {
+            return JsonSerializer.Deserialize<Dictionary<string, string>>(json) ?? new();
+        }
+        catch (JsonException)
+        {
+            return new();
+        }
     }
 }
