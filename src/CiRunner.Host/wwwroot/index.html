@@ -473,7 +473,7 @@ async function renderJobsList(){
       return `<span title="#${b.number} · ${b.status}" style="height:${h}%;background:${bm.color};opacity:${b.status==='aborted'?.55:1}"></span>`;
     }).join('');
     return `
-    <div class="trow clickable" style="grid-template-columns:1.7fr 1fr 150px 90px" onclick="navigate('/jobs/${encodeURIComponent(job.name)}')">
+    <div class="trow clickable" style="grid-template-columns:1.7fr 1fr 150px 90px" data-testid="job-row-${esc(job.name)}" onclick="navigate('/jobs/${encodeURIComponent(job.name)}')">
       <div style="display:flex;align-items:center;gap:11px;min-width:0">
         <span style="width:9px;height:9px;border-radius:50%;background:${m.color};flex-shrink:0" class="${m.anim}"></span>
         <div style="min-width:0">
@@ -524,7 +524,7 @@ async function renderJobHistory(params){
           <span>${esc(job.repoUrl || 'no repository')}</span><span>pipeline: ${esc(job.pipelineSource)}</span>
         </div>
       </div>
-      ${canOperate() ? `<button class="btn primary" onclick="triggerJob('${esc(name)}')">Run now</button>` : ''}
+      ${canOperate() ? `<button class="btn primary" data-testid="run-now-btn" onclick="triggerJob('${esc(name)}')">Run now</button>` : ''}
     </div>
     <div class="card">
       <div class="thead" style="grid-template-columns:64px 118px 1fr 100px 90px"><div>Build</div><div>Status</div><div>Note</div><div>Duration</div><div style="text-align:right">When</div></div>
@@ -621,7 +621,7 @@ async function refreshBuildDetail(scaffold){
     { id: 'artifacts', label: 'Artifacts', count: artifacts.length, fail: false },
   ];
   document.getElementById('build-tabbar').innerHTML = tabs.map(t => `
-    <div class="tab ${activeBuildTab===t.id?'active':''}" onclick="switchBuildTab('${t.id}')">
+    <div class="tab ${activeBuildTab===t.id?'active':''}" data-testid="build-tab-${t.id}" onclick="switchBuildTab('${t.id}')">
       ${t.label}<span class="count ${t.fail?'fail':''}">${t.count}</span>
     </div>`).join('');
 
@@ -873,13 +873,13 @@ async function renderAdmin(){
     <h1 class="display">Admin</h1>
     <p class="sub" style="margin-bottom:20px">User roles and API tokens (spec §9)</p>
     <div class="tabbar">
-      <div class="tab ${adminTab==='settings'?'active':''}" onclick="switchAdminTab('settings')">Settings</div>
-      <div class="tab ${adminTab==='jobs'?'active':''}" onclick="switchAdminTab('jobs')">Jobs</div>
-      <div class="tab ${adminTab==='hooks'?'active':''}" onclick="switchAdminTab('hooks')">Hooks</div>
-      <div class="tab ${adminTab==='resources'?'active':''}" onclick="switchAdminTab('resources')">Resources</div>
-      <div class="tab ${adminTab==='users'?'active':''}" onclick="switchAdminTab('users')">Users</div>
-      <div class="tab ${adminTab==='tokens'?'active':''}" onclick="switchAdminTab('tokens')">API Tokens</div>
-      <div class="tab ${adminTab==='audit'?'active':''}" onclick="switchAdminTab('audit')">Audit Log</div>
+      <div class="tab ${adminTab==='settings'?'active':''}" data-testid="admin-tab-settings" onclick="switchAdminTab('settings')">Settings</div>
+      <div class="tab ${adminTab==='jobs'?'active':''}" data-testid="admin-tab-jobs" onclick="switchAdminTab('jobs')">Jobs</div>
+      <div class="tab ${adminTab==='hooks'?'active':''}" data-testid="admin-tab-hooks" onclick="switchAdminTab('hooks')">Hooks</div>
+      <div class="tab ${adminTab==='resources'?'active':''}" data-testid="admin-tab-resources" onclick="switchAdminTab('resources')">Resources</div>
+      <div class="tab ${adminTab==='users'?'active':''}" data-testid="admin-tab-users" onclick="switchAdminTab('users')">Users</div>
+      <div class="tab ${adminTab==='tokens'?'active':''}" data-testid="admin-tab-tokens" onclick="switchAdminTab('tokens')">API Tokens</div>
+      <div class="tab ${adminTab==='audit'?'active':''}" data-testid="admin-tab-audit" onclick="switchAdminTab('audit')">Audit Log</div>
     </div>
     <div id="admin-content"></div>
   </div>`;
@@ -927,7 +927,7 @@ async function renderAdminUsers(el){
       <div style="display:flex;gap:8px;align-items:center">
         <input id="au-username" placeholder="username" style="flex:1;padding:8px 10px;background:var(--surface-2);border:1px solid var(--border);border-radius:7px;color:var(--text)">
         <select id="au-role" class="rolesel"><option value="viewer">viewer</option><option value="operator">operator</option><option value="admin">admin</option></select>
-        <button class="btn primary" onclick="assignUserRole()">Assign</button>
+        <button class="btn primary" data-testid="assign-role-btn" onclick="assignUserRole()">Assign</button>
       </div>
       <div class="login-error" id="au-error" style="display:none;margin:10px 0 0"></div>
     </div>`;
@@ -1060,12 +1060,12 @@ async function renderAdminJobs(el){
   el.innerHTML = `
     <div style="display:flex;justify-content:flex-end;gap:8px;margin-bottom:12px">
       <button class="btn" onclick="importJobPrompt()">Import JSON</button>
-      <button class="btn primary" onclick="newJobForm()">New Job</button>
+      <button class="btn primary" data-testid="new-job-btn" onclick="newJobForm()">New Job</button>
     </div>
     <div class="card">
       <div class="thead" style="grid-template-columns:1.4fr 100px 100px 1fr 90px"><div>Name</div><div>Source</div><div>Enabled</div><div>Resources</div><div></div></div>
       <div>${jobs.length === 0 ? `<div style="padding:16px" class="sub">No jobs configured yet.</div>` : jobs.map(j => `
-        <div class="trow" style="grid-template-columns:1.4fr 100px 100px 1fr 90px">
+        <div class="trow" style="grid-template-columns:1.4fr 100px 100px 1fr 90px" data-testid="admin-job-row-${esc(j.name)}">
           <div style="font-weight:600;cursor:pointer" onclick="editJobForm('${esc(j.name)}')">${esc(j.name)}</div>
           <div class="mono sub">${esc(j.pipelineSource)}</div>
           <div>${j.enabled ? '<span class="sub">yes</span>' : '<span style="color:var(--st-failed)">no</span>'}</div>
@@ -1129,7 +1129,7 @@ async function renderJobForm(el){
       </div>
       <div class="login-error" id="jf-error" style="display:none;margin-top:12px"></div>
       <div style="display:flex;gap:8px;margin-top:16px">
-        <button class="btn primary" onclick="saveJobForm()">Save</button>
+        <button class="btn primary" data-testid="save-job-btn" onclick="saveJobForm()">Save</button>
         <button class="btn" onclick="closeJobForm()">Cancel</button>
       </div>
     </div>`;

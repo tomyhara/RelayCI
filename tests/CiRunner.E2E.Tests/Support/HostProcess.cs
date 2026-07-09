@@ -3,7 +3,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text.Json;
 
-namespace CiRunner.Host.Tests.Support;
+namespace CiRunner.E2E.Tests.Support;
 
 public sealed record TestLocalUser(string Username, string Password, string Role);
 
@@ -17,6 +17,7 @@ public sealed class HostProcess : IAsyncDisposable
     public HttpClient Client { get; }
     public string Root { get; }
     public int Port { get; }
+    public string BaseUrl => $"http://127.0.0.1:{Port}/";
 
     private Process? _process;
     private readonly bool _deleteRootOnDispose;
