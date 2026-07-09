@@ -117,6 +117,7 @@ builder.Services.AddSingleton(sp => new BuildRunner(
     serverUrl,
     config.Git.ExePath));
 builder.Services.AddSingleton<RetentionService>();
+builder.Services.AddSingleton<ResourceLockManager>();
 builder.Services.AddSingleton(sp =>
 {
     var executorLimit = sp.GetRequiredService<SettingsRepository>().GetInt("executors", 2);
@@ -127,7 +128,8 @@ builder.Services.AddSingleton(sp =>
         sp.GetRequiredService<GlobalEventHub>(),
         executorLimit,
         sp.GetRequiredService<RetentionService>(),
-        sp.GetRequiredService<SettingsRepository>());
+        sp.GetRequiredService<SettingsRepository>(),
+        sp.GetRequiredService<ResourceLockManager>());
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<BuildDispatcher>());
 builder.Services.AddSingleton<JobTriggerService>();
@@ -515,8 +517,40 @@ app.MapGet("/api/admin/hooks/{name}/runs", (string name, HookRepository hookRepo
 
 // ---- F6: resource descriptions (spec §5 F3a/F6 "リソース"). Lock/wait state is F3a (runtime-only). ----
 
-app.MapGet("/api/admin/resources", (ResourceDefRepository resourceDefs) => Results.Ok(resourceDefs.ListAll()))
-    .RequireAuthorization("Admin");
+app.MapGet("/api/admin/resources", (ResourceDefRepository resourceDefs, BuildRepository buildRepo, JobRepository jobRepo, ResourceLockManager resourceLocks) =>
+{
+    // Union of "described" resources and "currently held" resources - a resource is just a string a
+    // job declares (spec §5 F3a "事前定義不要"), so a lock can exist with no description at all.
+    var defs = resourceDefs.ListAll().ToDictionary(d => d.Name);
+    var held = resourceLocks.Snapshot();
+    var waitingJobResources = buildRepo.ListQueued()
+        .Where(b => b.Status == BuildStatus.Waiting)
+        .Select(b => jobRepo.FindById(b.JobId))
+        .Where(j => j is not null)
+        .Select(j => { try { return JsonSerializer.Deserialize<List<string>>(j!.Resources) ?? new(); } catch (JsonException) { return new List<string>(); } })
+        .ToList();
+
+    var names = defs.Keys.Union(held.Keys).OrderBy(n => n, StringComparer.Ordinal);
+    var result = names.Select(name =>
+    {
+        defs.TryGetValue(name, out var def);
+        var holderBuildId = held.TryGetValue(name, out var h) ? (long?)h : null;
+        var holderBuild = holderBuildId is null ? null : buildRepo.FindById(holderBuildId.Value);
+        var holderJob = holderBuild is null ? null : jobRepo.FindById(holderBuild.JobId);
+        return new
+        {
+            Name = name,
+            def?.Description,
+            def?.UpdatedAt,
+            def?.UpdatedBy,
+            HeldByBuildId = holderBuildId,
+            HeldByJobName = holderJob?.Name,
+            HeldByNumber = holderBuild?.Number,
+            WaitingCount = waitingJobResources.Count(r => r.Contains(name)),
+        };
+    }).ToList();
+    return Results.Ok(result);
+}).RequireAuthorization("Admin");
 
 app.MapPost("/api/admin/resources", (ResourceDefRequest? body, ResourceDefRepository resourceDefs, AuditLogRepository audit, ClaimsPrincipal actor) =>
 {
@@ -534,6 +568,21 @@ app.MapDelete("/api/admin/resources/{name}", (string name, ResourceDefRepository
     return Results.Ok();
 }).RequireAuthorization("Admin");
 
+app.MapPost("/api/admin/resources/{name}/release", (string name, ResourceLockManager resourceLocks, BuildDispatcher dispatcher, BuildRepository buildRepo, JobRepository jobRepo, AuditLogRepository audit, ClaimsPrincipal actor) =>
+{
+    // Emergency-use escape hatch (spec §5 F3a "異常時用"): does not touch the holding build itself,
+    // which may still be running and believes it holds the resource. That's the admin's call to make.
+    var holderId = resourceLocks.ForceRelease(name);
+    if (holderId is null) return Results.NotFound(new { error = $"resource '{name}' is not currently held" });
+
+    var holderBuild = buildRepo.FindById(holderId.Value);
+    var holderJob = holderBuild is null ? null : jobRepo.FindById(holderBuild.JobId);
+    dispatcher.Signal();
+    audit.Record(actor.Identity!.Name!, "resource.force_release", name,
+        JsonSerializer.Serialize(new { heldByBuildId = holderId, jobName = holderJob?.Name, number = holderBuild?.Number }), null);
+    return Results.Ok(new { releasedFromBuildId = holderId });
+}).RequireAuthorization("Admin");
+
 app.MapGet("/api/jobs", (JobRepository jobRepo, BuildRepository buildRepo) =>
 {
     var jobs = jobRepo.ListEnabled().Select(j => new
@@ -548,7 +597,7 @@ app.MapGet("/api/jobs", (JobRepository jobRepo, BuildRepository buildRepo) =>
     return Results.Ok(jobs);
 }).RequireAuthorization("Viewer");
 
-app.MapGet("/api/queue", (BuildRepository buildRepo, JobRepository jobRepo) =>
+app.MapGet("/api/queue", (BuildRepository buildRepo, JobRepository jobRepo, ResourceLockManager resourceLocks) =>
 {
     var queued = buildRepo.ListQueued();
     var result = queued.Select((b, i) =>
@@ -563,6 +612,8 @@ app.MapGet("/api/queue", (BuildRepository buildRepo, JobRepository jobRepo) =>
             b.Status,
             b.Trigger,
             b.QueuedAt,
+            // Spec §5 F3a: "Waiting のビルドには「どのリソースを、どのビルドが塞いでいるか」を表示する".
+            BlockedBy = b.Status == BuildStatus.Waiting ? DescribeBlockers(b, job, buildRepo, jobRepo, resourceLocks) : null,
         };
     });
     return Results.Ok(result);
@@ -790,6 +841,44 @@ static object? MapBuildSummary(BuildRecord? b) => b is null ? null : new
     b.StartedAt,
     b.FinishedAt,
 };
+
+/// <summary>Spec §5 F3a: for a Waiting build, which of its declared resources are held and by which
+/// other build. Null (rather than an empty list) when nothing is actually contended, e.g. a build
+/// that just transitioned to Waiting this instant and hasn't lost the race to anyone yet.</summary>
+static List<object>? DescribeBlockers(BuildRecord waiting, JobRecord? job, BuildRepository buildRepo, JobRepository jobRepo, ResourceLockManager resourceLocks)
+{
+    if (job is null)
+    {
+        return null;
+    }
+    List<string>? resources;
+    try
+    {
+        resources = JsonSerializer.Deserialize<List<string>>(job.Resources);
+    }
+    catch (JsonException)
+    {
+        return null;
+    }
+    if (resources is null || resources.Count == 0)
+    {
+        return null;
+    }
+
+    var blockers = new List<object>();
+    foreach (var resource in resources)
+    {
+        var holderId = resourceLocks.HolderOf(resource);
+        if (holderId is null || holderId == waiting.Id)
+        {
+            continue;
+        }
+        var holderBuild = buildRepo.FindById(holderId.Value);
+        var holderJob = holderBuild is null ? null : jobRepo.FindById(holderBuild.JobId);
+        blockers.Add(new { Resource = resource, BuildId = holderId, JobName = holderJob?.Name, Number = holderBuild?.Number });
+    }
+    return blockers.Count > 0 ? blockers : null;
+}
 
 static string? ValidateJobRequest(JobAdminRequest body)
 {

@@ -838,12 +838,15 @@ async function renderQueue(){
   if (queue.length === 0) { rowsEl.innerHTML = `<div class="emptystate">Queue is empty.</div>`; return; }
   rowsEl.innerHTML = `<div style="display:flex;flex-direction:column;gap:8px">` + queue.map(q => {
     const m = meta(q.status);
+    // Spec §5 F3a: a Waiting build shows which resource(s) and which build are blocking it.
+    const blockers = (q.blockedBy || []).map(b => `<span class="link" onclick="navigate('/builds/${b.buildId}')">${esc(b.resource)} (#${b.number} ${esc(b.jobName||'')})</span>`).join(', ');
     return `
     <div style="display:flex;align-items:center;gap:14px;padding:13px 16px;background:var(--surface);border:1px solid var(--border);border-radius:10px;box-shadow:var(--shadow)">
       <span class="mono" style="width:26px;height:26px;border-radius:8px;background:${m.soft};color:${m.color};display:flex;align-items:center;justify-content:center;font-weight:600;font-size:12px">${q.position}</span>
       <div style="flex:1;min-width:0">
         <div style="font-weight:600;font-size:13.5px;display:flex;align-items:center;gap:8px">${esc(q.jobName)} <span class="mono sub">#${q.number}</span></div>
         <div class="mono sub" style="font-size:11px">${esc(q.trigger)} · queued ${fmtRelative(q.queuedAt)}</div>
+        ${blockers ? `<div class="sub" style="font-size:11px;margin-top:3px">blocked by ${blockers}</div>` : ''}
       </div>
       ${statusBadge(q.status)}
     </div>`;
@@ -873,6 +876,7 @@ async function renderAdmin(){
       <div class="tab ${adminTab==='settings'?'active':''}" onclick="switchAdminTab('settings')">Settings</div>
       <div class="tab ${adminTab==='jobs'?'active':''}" onclick="switchAdminTab('jobs')">Jobs</div>
       <div class="tab ${adminTab==='hooks'?'active':''}" onclick="switchAdminTab('hooks')">Hooks</div>
+      <div class="tab ${adminTab==='resources'?'active':''}" onclick="switchAdminTab('resources')">Resources</div>
       <div class="tab ${adminTab==='users'?'active':''}" onclick="switchAdminTab('users')">Users</div>
       <div class="tab ${adminTab==='tokens'?'active':''}" onclick="switchAdminTab('tokens')">API Tokens</div>
       <div class="tab ${adminTab==='audit'?'active':''}" onclick="switchAdminTab('audit')">Audit Log</div>
@@ -884,6 +888,7 @@ async function renderAdmin(){
   if (adminTab === 'settings') renderAdminSettings(el);
   else if (adminTab === 'jobs') renderAdminJobs(el);
   else if (adminTab === 'hooks') renderAdminHooks(el);
+  else if (adminTab === 'resources') renderAdminResources(el);
   else if (adminTab === 'tokens') renderAdminTokens(el);
   else if (adminTab === 'audit') renderAdminAudit(el);
   else renderAdminUsers(el);
@@ -1306,6 +1311,46 @@ async function renderHookRuns(el){
           <div class="mono sub" style="font-size:11px">${(JSON.parse(r.triggeredBuilds || '[]')).map(id => `<span class="link" onclick="navigate('/builds/${id}')">#${id}</span>`).join(', ') || '–'}</div>
         </div>`).join('')}</div>
     </div>`;
+}
+
+/* ================= ADMIN: RESOURCES ================= */
+async function renderAdminResources(el){
+  const resources = await api('/api/admin/resources');
+  el.innerHTML = `
+    <div class="card" style="margin-bottom:16px">
+      <div class="thead" style="grid-template-columns:1fr 1.4fr 1.2fr 80px 100px"><div>Name</div><div>Description</div><div>Held by</div><div>Waiting</div><div></div></div>
+      <div>${resources.length === 0 ? `<div style="padding:16px" class="sub">No resources declared or described yet. Jobs declare resources in their config (Jobs tab).</div>` : resources.map(r => `
+        <div class="trow" style="grid-template-columns:1fr 1.4fr 1.2fr 80px 100px">
+          <div style="font-weight:600">${esc(r.name)}</div>
+          <div class="sub" style="font-size:12px">${esc(r.description || '')}</div>
+          <div class="sub" style="font-size:12px">${r.heldByBuildId ? `<span class="link" onclick="navigate('/builds/${r.heldByBuildId}')">#${r.heldByNumber} ${esc(r.heldByJobName||'')}</span>` : '<span class="sub">free</span>'}</div>
+          <div class="mono sub">${r.waitingCount || 0}</div>
+          <div style="text-align:right">${r.heldByBuildId ? `<button class="btn danger" style="padding:5px 10px;font-size:12px" onclick="forceReleaseResource('${esc(r.name)}')">Release</button>` : ''}</div>
+        </div>`).join('')}</div>
+    </div>
+    <div class="card" style="padding:14px 16px">
+      <div style="font-weight:600;margin-bottom:10px;font-size:13px">Add / update description</div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <input id="rd-name" placeholder="resource name" style="flex:1;padding:8px 10px;background:var(--surface-2);border:1px solid var(--border);border-radius:7px;color:var(--text)">
+        <input id="rd-description" placeholder="description (optional)" style="flex:2;padding:8px 10px;background:var(--surface-2);border:1px solid var(--border);border-radius:7px;color:var(--text)">
+        <button class="btn primary" onclick="saveResourceDef()">Save</button>
+      </div>
+    </div>`;
+}
+
+async function saveResourceDef(){
+  const name = document.getElementById('rd-name').value.trim();
+  const description = document.getElementById('rd-description').value.trim() || null;
+  if (!name) return;
+  await fetch('/api/admin/resources', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, description }) });
+  renderAdmin();
+}
+
+async function forceReleaseResource(name){
+  if (!confirm(`Force-release “${name}”? The build currently holding it is NOT stopped and may still be using it - only do this for a stuck/crashed build (spec §5 F3a).`)) return;
+  const res = await fetch(`/api/admin/resources/${encodeURIComponent(name)}/release`, { method: 'POST' });
+  if (!res.ok) { const b = await res.json().catch(() => ({})); alert(b.error || `Failed (${res.status})`); return; }
+  renderAdmin();
 }
 
 /* ---------- global SSE: keep current view fresh ---------- */

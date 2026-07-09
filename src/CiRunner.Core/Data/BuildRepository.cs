@@ -115,12 +115,16 @@ public sealed class BuildRepository
         return Convert.ToInt32(cmd.ExecuteScalar());
     }
 
+    /// <summary>Dispatch candidates: Queued (never started) and Waiting (blocked on a resource lock, spec
+    /// §5 F3a) builds, in FIFO order. Waiting builds must stay in this set so the dispatcher keeps
+    /// re-evaluating them every tick as resources free up.</summary>
     public List<BuildRecord> ListQueued()
     {
         using var conn = _db.OpenConnection();
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT * FROM builds WHERE status = $status ORDER BY queued_at";
-        cmd.Parameters.AddWithValue("$status", BuildStatus.Queued);
+        cmd.CommandText = "SELECT * FROM builds WHERE status IN ($queued, $waiting) ORDER BY queued_at";
+        cmd.Parameters.AddWithValue("$queued", BuildStatus.Queued);
+        cmd.Parameters.AddWithValue("$waiting", BuildStatus.Waiting);
         using var reader = cmd.ExecuteReader();
         var result = new List<BuildRecord>();
         while (reader.Read())

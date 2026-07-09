@@ -1,12 +1,13 @@
+using System.Text.Json;
 using CiRunner.Core.Data;
 using Microsoft.Extensions.Hosting;
 
 namespace CiRunner.Core.Engine;
 
 /// <summary>
-/// Single dispatch loop: atomically decides "Executor 空き・当該ジョブ非実行中" per build before starting it
-/// (spec §5 F1 "同一ジョブの直列性はディスパッチャの不変条件"). Resource locks (F3a) and queue_policy dedup
-/// are out of scope for the M1 slice and are picked up in a later milestone.
+/// Single dispatch loop: atomically decides "Executor 空き・当該ジョブ非実行中・宣言リソース空き" per
+/// build before starting it (spec §5 F1 "同一ジョブの直列性はディスパッチャの不変条件", §5 F3a リソース
+/// ロック). queue_policy dedup is handled upstream in JobTriggerService.
 /// </summary>
 public sealed class BuildDispatcher : BackgroundService
 {
@@ -17,13 +18,14 @@ public sealed class BuildDispatcher : BackgroundService
     private readonly RetentionService? _retentionService;
     private readonly int _executorLimit;
     private readonly SettingsRepository? _settings;
+    private readonly ResourceLockManager _resourceLocks;
 
     private readonly object _stateLock = new();
     private readonly HashSet<long> _runningJobIds = new();
     private int _activeExecutors;
     private readonly SemaphoreSlim _wake = new(1);
 
-    public BuildDispatcher(BuildRepository buildRepo, JobRepository jobRepo, BuildRunner buildRunner, GlobalEventHub eventHub, int executorLimit = 2, RetentionService? retentionService = null, SettingsRepository? settings = null)
+    public BuildDispatcher(BuildRepository buildRepo, JobRepository jobRepo, BuildRunner buildRunner, GlobalEventHub eventHub, int executorLimit = 2, RetentionService? retentionService = null, SettingsRepository? settings = null, ResourceLockManager? resourceLocks = null)
     {
         _buildRepo = buildRepo;
         _jobRepo = jobRepo;
@@ -32,6 +34,7 @@ public sealed class BuildDispatcher : BackgroundService
         _retentionService = retentionService;
         _executorLimit = executorLimit;
         _settings = settings;
+        _resourceLocks = resourceLocks ?? new ResourceLockManager();
     }
 
     /// <summary>
@@ -69,6 +72,9 @@ public sealed class BuildDispatcher : BackgroundService
 
     private void DispatchOnce(CancellationToken stoppingToken)
     {
+        // FIFO order (queued_at), but a build blocked on a resource is skipped rather than stopping
+        // the loop, so a later build with lighter resource needs can overtake it (spec §5 F3a
+        // "後続の単一リソース待ちが空きリソースを追い越し取得することは許す").
         var queued = _buildRepo.ListQueued();
         foreach (var build in queued)
         {
@@ -77,6 +83,7 @@ public sealed class BuildDispatcher : BackgroundService
             {
                 continue;
             }
+            var resources = ParseResources(job.Resources);
 
             lock (_stateLock)
             {
@@ -88,14 +95,35 @@ public sealed class BuildDispatcher : BackgroundService
                 {
                     continue;
                 }
+                if (resources.Count > 0 && !_resourceLocks.TryAcquireAll(build.Id, resources))
+                {
+                    // All-or-nothing miss: never partially acquired, so nothing to roll back here.
+                    if (build.Status != Models.BuildStatus.Waiting)
+                    {
+                        _buildRepo.UpdateStatus(build.Id, Models.BuildStatus.Waiting);
+                    }
+                    continue;
+                }
                 _activeExecutors++;
                 _runningJobIds.Add(build.JobId);
             }
 
             _buildRepo.UpdateStatus(build.Id, Models.BuildStatus.Running, startedAt: DateTimeOffset.Now.ToString("o"));
-            _eventHub.Publish(System.Text.Json.JsonSerializer.Serialize(new { buildId = build.Id, type = "build-started", payload = new { } }));
+            _eventHub.Publish(JsonSerializer.Serialize(new { buildId = build.Id, type = "build-started", payload = new { } }));
 
             _ = RunAndReleaseAsync(job, build, stoppingToken);
+        }
+    }
+
+    private static List<string> ParseResources(string resourcesJson)
+    {
+        try
+        {
+            return JsonSerializer.Deserialize<List<string>>(resourcesJson) ?? new List<string>();
+        }
+        catch (JsonException)
+        {
+            return new List<string>();
         }
     }
 
@@ -108,6 +136,9 @@ public sealed class BuildDispatcher : BackgroundService
         }
         finally
         {
+            // Always safe to call even if this build never held any resource (spec §5 F3a "解放:
+            // ビルド終了...で自動解放").
+            _resourceLocks.ReleaseAll(build.Id);
             lock (_stateLock)
             {
                 _activeExecutors--;

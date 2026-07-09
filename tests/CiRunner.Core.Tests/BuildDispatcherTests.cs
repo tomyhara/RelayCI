@@ -112,6 +112,94 @@ public class BuildDispatcherTests
         }
     }
 
+    private static JobConfigInput ConfigWithResources(string name, string[] resources) => new(
+        Name: name, RepoUrl: null, WorkspacePath: null, PipelineSource: "server", PipelinePath: "pipeline.cipipe",
+        ParametersJson: "[]", CronSchedulesJson: "[]", PollingBranchesJson: null,
+        ResourcesJson: System.Text.Json.JsonSerializer.Serialize(resources),
+        QueuePolicy: "replace", TimeoutMinutes: null, Retention: null, ShellPath: null, Enabled: true);
+
+    // F3a: all-or-nothing resource contention - the second build Waits, then runs once the first
+    // releases (ci-runner-test-spec.md §3.1 ENG-010).
+    [Fact]
+    public async Task Dispatcher_ResourceContention_SecondBuildWaitsThenRunsAfterFirstReleases_ENG010()
+    {
+        using var fx = new EngineFixture();
+        var jobA = fx.CreateJob("res-a", """Stage "Work" { Start-Sleep -Milliseconds 1500 }""");
+        var jobB = fx.CreateJob("res-b", """Stage "Work" { Start-Sleep -Milliseconds 200 }""");
+        fx.Jobs.UpsertConfiguredJob(ConfigWithResources(jobA.Name, new[] { "bench-1" }));
+        fx.Jobs.UpsertConfiguredJob(ConfigWithResources(jobB.Name, new[] { "bench-1" }));
+        var locks = new ResourceLockManager();
+        var dispatcher = new BuildDispatcher(fx.Builds, fx.Jobs, fx.Runner, fx.EventHub, executorLimit: 2, resourceLocks: locks);
+        await dispatcher.StartAsync(CancellationToken.None);
+        try
+        {
+            var bA = fx.Builds.CreateQueued(jobA.Id, BuildTrigger.Manual, "{}", null);
+            dispatcher.Signal();
+            await WaitUntilRunningAsync(fx, bA.Id, TimeSpan.FromSeconds(10));
+
+            var bB = fx.Builds.CreateQueued(jobB.Id, BuildTrigger.Manual, "{}", null);
+            dispatcher.Signal();
+            await Task.Delay(300);
+            Assert.Equal(BuildStatus.Waiting, fx.Builds.FindById(bB.Id)!.Status);
+            Assert.Equal(bA.Id, locks.HolderOf("bench-1")); // UI-facing "which build blocks it" lookup
+
+            await WaitUntilTerminalAsync(fx, bA.Id, TimeSpan.FromSeconds(10));
+            await WaitUntilTerminalAsync(fx, bB.Id, TimeSpan.FromSeconds(10));
+
+            var rA = fx.Builds.FindById(bA.Id)!;
+            var rB = fx.Builds.FindById(bB.Id)!;
+            Assert.Equal(BuildStatus.Success, rB.Status);
+            Assert.True(DateTimeOffset.Parse(rB.StartedAt!) >= DateTimeOffset.Parse(rA.FinishedAt!),
+                "B must not start until A released bench-1.");
+            Assert.Null(locks.HolderOf("bench-1"));
+        }
+        finally
+        {
+            await dispatcher.StopAsync(CancellationToken.None);
+        }
+    }
+
+    // F3a: FIFO overtaking - a later single-resource build may acquire and run while an earlier
+    // multi-resource build is still Waiting on a different resource (ENG-011), and the multi-resource
+    // build never partially holds bench-2 while it does (ENG-012, implicitly: it stays Waiting throughout).
+    [Fact]
+    public async Task Dispatcher_LaterSingleResourceBuild_OvertakesEarlierMultiResourceWait_ENG011()
+    {
+        using var fx = new EngineFixture();
+        var jobHold = fx.CreateJob("hold-a", """Stage "Work" { Start-Sleep -Milliseconds 1500 }""");
+        var jobMulti = fx.CreateJob("multi", """Stage "Work" { Start-Sleep -Milliseconds 200 }""");
+        var jobSingle = fx.CreateJob("single", """Stage "Work" { Start-Sleep -Milliseconds 200 }""");
+        fx.Jobs.UpsertConfiguredJob(ConfigWithResources(jobHold.Name, new[] { "bench-1" }));
+        fx.Jobs.UpsertConfiguredJob(ConfigWithResources(jobMulti.Name, new[] { "bench-1", "bench-2" }));
+        fx.Jobs.UpsertConfiguredJob(ConfigWithResources(jobSingle.Name, new[] { "bench-2" }));
+        var locks = new ResourceLockManager();
+        var dispatcher = new BuildDispatcher(fx.Builds, fx.Jobs, fx.Runner, fx.EventHub, executorLimit: 3, resourceLocks: locks);
+        await dispatcher.StartAsync(CancellationToken.None);
+        try
+        {
+            var bHold = fx.Builds.CreateQueued(jobHold.Id, BuildTrigger.Manual, "{}", null);
+            dispatcher.Signal();
+            await WaitUntilRunningAsync(fx, bHold.Id, TimeSpan.FromSeconds(10));
+
+            var bMulti = fx.Builds.CreateQueued(jobMulti.Id, BuildTrigger.Manual, "{}", null);
+            dispatcher.Signal();
+            await Task.Delay(300);
+            Assert.Equal(BuildStatus.Waiting, fx.Builds.FindById(bMulti.Id)!.Status);
+            Assert.Null(locks.HolderOf("bench-2")); // ENG-012: multi must not be holding bench-2 while blocked on bench-1
+
+            var bSingle = fx.Builds.CreateQueued(jobSingle.Id, BuildTrigger.Manual, "{}", null);
+            dispatcher.Signal();
+
+            await WaitUntilTerminalAsync(fx, bSingle.Id, TimeSpan.FromSeconds(10));
+            Assert.Equal(BuildStatus.Success, fx.Builds.FindById(bSingle.Id)!.Status);
+            Assert.Equal(BuildStatus.Waiting, fx.Builds.FindById(bMulti.Id)!.Status); // still waiting on bench-1
+        }
+        finally
+        {
+            await dispatcher.StopAsync(CancellationToken.None);
+        }
+    }
+
     [Fact]
     public async Task Dispatcher_ExecutorTwo_DifferentJobsRunConcurrently_ENG003()
     {
