@@ -59,6 +59,59 @@ public class BuildDispatcherTests
         }
     }
 
+    private static async Task WaitUntilRunningAsync(EngineFixture fx, long buildId, TimeSpan timeout)
+    {
+        using var cts = new CancellationTokenSource(timeout);
+        while (!cts.IsCancellationRequested)
+        {
+            if (fx.Builds.FindById(buildId)!.Status == BuildStatus.Running)
+            {
+                return;
+            }
+            await Task.Delay(50, CancellationToken.None);
+        }
+        throw new TimeoutException($"Build {buildId} did not start running in time.");
+    }
+
+    // F6: "executors" is read live from SettingsRepository on every dispatch tick, so a settings-screen
+    // change applies without a runner restart (spec §5 F6 "再起動不要で即時反映").
+    [Fact]
+    public async Task Dispatcher_ExecutorLimitChangedViaSettings_TakesEffectWithoutRestart()
+    {
+        using var fx = new EngineFixture();
+        var jobA = fx.CreateJob("live-a", """Stage "Work" { Start-Sleep -Milliseconds 2500 }""");
+        var jobB = fx.CreateJob("live-b", """Stage "Work" { Start-Sleep -Milliseconds 200 }""");
+        fx.Settings.Set("executors", "1");
+        var dispatcher = new BuildDispatcher(fx.Builds, fx.Jobs, fx.Runner, fx.EventHub, executorLimit: 1, retentionService: null, settings: fx.Settings);
+        await dispatcher.StartAsync(CancellationToken.None);
+        try
+        {
+            var bA = fx.Builds.CreateQueued(jobA.Id, BuildTrigger.Manual, "{}", null);
+            dispatcher.Signal();
+            await WaitUntilRunningAsync(fx, bA.Id, TimeSpan.FromSeconds(10));
+
+            var bB = fx.Builds.CreateQueued(jobB.Id, BuildTrigger.Manual, "{}", null);
+            dispatcher.Signal();
+            await Task.Delay(400);
+            Assert.Equal(BuildStatus.Queued, fx.Builds.FindById(bB.Id)!.Status); // still capped at 1 while A runs
+
+            fx.Settings.Set("executors", "2");
+            dispatcher.Signal();
+            await WaitUntilTerminalAsync(fx, bB.Id, TimeSpan.FromSeconds(10));
+
+            var rA = fx.Builds.FindById(bA.Id)!;
+            var rB = fx.Builds.FindById(bB.Id)!;
+            Assert.Equal(BuildStatus.Success, rB.Status);
+            // A (2.5s sleep) is still running when B (0.2s sleep) finishes - only possible if B started
+            // concurrently with A, which the old fixed-at-construction executorLimit=1 would never allow.
+            Assert.Equal(BuildStatus.Running, rA.Status);
+        }
+        finally
+        {
+            await dispatcher.StopAsync(CancellationToken.None);
+        }
+    }
+
     [Fact]
     public async Task Dispatcher_ExecutorTwo_DifferentJobsRunConcurrently_ENG003()
     {

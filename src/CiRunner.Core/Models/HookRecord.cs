@@ -8,6 +8,7 @@ public sealed class HookRecord
     public required string HandlerPath { get; set; }
     public int TimeoutSec { get; set; } = 60;
     public bool Enabled { get; set; } = true;
+    public bool Deleted { get; set; }
     public required string CreatedAt { get; set; }
 }
 

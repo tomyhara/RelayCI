@@ -47,7 +47,32 @@ public sealed class CiDatabase
             cmd.CommandText = Schema;
             cmd.ExecuteNonQuery();
         }
+        AddColumnIfMissing(conn, tx, "hooks", "deleted", "INTEGER NOT NULL DEFAULT 0");
         tx.Commit();
+    }
+
+    /// <summary>
+    /// `CREATE TABLE IF NOT EXISTS` doesn't add columns to a table that already exists from an
+    /// earlier version, so new columns on existing tables need this instead (SQLite has no
+    /// `ADD COLUMN IF NOT EXISTS`).
+    /// </summary>
+    private static void AddColumnIfMissing(SqliteConnection conn, SqliteTransaction tx, string table, string column, string columnDefSql)
+    {
+        using (var check = conn.CreateCommand())
+        {
+            check.Transaction = tx;
+            check.CommandText = $"SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = $column";
+            check.Parameters.AddWithValue("$column", column);
+            if (Convert.ToInt64(check.ExecuteScalar()) > 0)
+            {
+                return;
+            }
+        }
+
+        using var alter = conn.CreateCommand();
+        alter.Transaction = tx;
+        alter.CommandText = $"ALTER TABLE {table} ADD COLUMN {column} {columnDefSql}";
+        alter.ExecuteNonQuery();
     }
 
     private const string Schema = """
@@ -78,7 +103,18 @@ public sealed class CiDatabase
             handler_path TEXT NOT NULL,
             timeout_sec INTEGER NOT NULL DEFAULT 60,
             enabled INTEGER NOT NULL DEFAULT 1,
+            deleted INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
+        );
+
+        -- Free-text descriptions for resource names declared on jobs.resources (spec §5 F3a/F6:
+        -- "リソースは事前定義不要の単なる文字列(設定画面で一覧・説明を管理可能)"). The lock state
+        -- itself (held/waiting) is runtime-only (F3a), not persisted here.
+        CREATE TABLE IF NOT EXISTS resource_defs (
+            name TEXT PRIMARY KEY,
+            description TEXT,
+            updated_at TEXT NOT NULL,
+            updated_by TEXT
         );
 
         CREATE TABLE IF NOT EXISTS hook_runs (

@@ -1,4 +1,5 @@
 using CiRunner.Core.Data;
+using CiRunner.Core.Models;
 using CiRunner.Core.Tests.Support;
 using Xunit;
 
@@ -53,5 +54,48 @@ public class JobRepositoryTests
         var names = repo.ListEnabled().Select(j => j.Name).ToList();
 
         Assert.Equal(new[] { "alpha", "zeta" }, names);
+    }
+
+    // F6: admin job deletion (spec §5 F6 "ジョブ削除は論理削除")
+    [Fact]
+    public void SoftDelete_HidesJobFromFindByNameAndListEnabled()
+    {
+        using var temp = new TempDatabase();
+        var repo = new JobRepository(temp.Db);
+        repo.UpsertServerJob("to-delete");
+
+        var deleted = repo.SoftDelete("to-delete");
+
+        Assert.True(deleted);
+        Assert.Null(repo.FindByName("to-delete"));
+        Assert.Empty(repo.ListEnabled());
+    }
+
+    [Fact]
+    public void SoftDelete_UnknownJob_ReturnsFalse()
+    {
+        using var temp = new TempDatabase();
+        var repo = new JobRepository(temp.Db);
+
+        Assert.False(repo.SoftDelete("does-not-exist"));
+    }
+
+    [Fact]
+    public void SoftDelete_ThenReUpsertConfiguredJob_StaysDeleted()
+    {
+        // Mirrors what happens on a restart: JobScanner re-applies jobs/<name>/job.json for every
+        // pipeline.cipipe it finds on disk, regardless of the DB's soft-delete state. UpsertConfiguredJob
+        // must never resurrect a deleted row purely by being called again with the same name.
+        using var temp = new TempDatabase();
+        var repo = new JobRepository(temp.Db);
+        repo.UpsertServerJob("to-delete");
+        repo.SoftDelete("to-delete");
+
+        repo.UpsertConfiguredJob(new JobConfigInput(
+            Name: "to-delete", RepoUrl: null, WorkspacePath: null, PipelineSource: "server", PipelinePath: "pipeline.cipipe",
+            ParametersJson: "[]", CronSchedulesJson: "[]", PollingBranchesJson: null, ResourcesJson: "[]",
+            QueuePolicy: "replace", TimeoutMinutes: null, Retention: null, ShellPath: null, Enabled: true));
+
+        Assert.Null(repo.FindByName("to-delete"));
     }
 }

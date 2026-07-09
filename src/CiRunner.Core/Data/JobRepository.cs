@@ -112,6 +112,31 @@ public sealed class JobRepository
         return FindByName(cfg.Name)!;
     }
 
+    /// <summary>Logical delete (spec §5 F6: "ジョブ削除は論理削除"). Build history/logs survive per the job's retention policy.</summary>
+    public bool SoftDelete(string name)
+    {
+        using var conn = _db.OpenConnection();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "UPDATE jobs SET deleted = 1 WHERE name = $name AND deleted = 0";
+        cmd.Parameters.AddWithValue("$name", name);
+        return cmd.ExecuteNonQuery() > 0;
+    }
+
+    /// <summary>
+    /// Clears a soft-delete so a deliberate admin "create"/"import" under a reused name reactivates
+    /// the row instead of leaving it invisibly deleted (UpsertConfiguredJob never touches `deleted`,
+    /// by design, so a passive JobScanner rescan can never silently resurrect a deleted job - only an
+    /// explicit call to this method can).
+    /// </summary>
+    public bool Undelete(string name)
+    {
+        using var conn = _db.OpenConnection();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "UPDATE jobs SET deleted = 0 WHERE name = $name AND deleted = 1";
+        cmd.Parameters.AddWithValue("$name", name);
+        return cmd.ExecuteNonQuery() > 0;
+    }
+
     private static JobRecord Map(SqliteDataReader r) => new()
     {
         Id = r.GetInt64(r.GetOrdinal("id")),

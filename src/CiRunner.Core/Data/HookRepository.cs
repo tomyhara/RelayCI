@@ -16,7 +16,7 @@ public sealed class HookRepository
     {
         using var conn = _db.OpenConnection();
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT * FROM hooks WHERE name = $name";
+        cmd.CommandText = "SELECT * FROM hooks WHERE name = $name AND deleted = 0";
         cmd.Parameters.AddWithValue("$name", name);
         using var reader = cmd.ExecuteReader();
         return reader.Read() ? Map(reader) : null;
@@ -26,7 +26,7 @@ public sealed class HookRepository
     {
         using var conn = _db.OpenConnection();
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT * FROM hooks ORDER BY name";
+        cmd.CommandText = "SELECT * FROM hooks WHERE deleted = 0 ORDER BY name";
         using var reader = cmd.ExecuteReader();
         var result = new List<HookRecord>();
         while (reader.Read())
@@ -34,6 +34,26 @@ public sealed class HookRepository
             result.Add(Map(reader));
         }
         return result;
+    }
+
+    /// <summary>Logical delete (spec §5 F6), mirroring JobRepository.SoftDelete: hook_runs history survives.</summary>
+    public bool SoftDelete(string name)
+    {
+        using var conn = _db.OpenConnection();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "UPDATE hooks SET deleted = 1 WHERE name = $name AND deleted = 0";
+        cmd.Parameters.AddWithValue("$name", name);
+        return cmd.ExecuteNonQuery() > 0;
+    }
+
+    /// <summary>Mirrors JobRepository.Undelete: reactivates a soft-deleted row for a deliberate admin re-create.</summary>
+    public bool Undelete(string name)
+    {
+        using var conn = _db.OpenConnection();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "UPDATE hooks SET deleted = 0 WHERE name = $name AND deleted = 1";
+        cmd.Parameters.AddWithValue("$name", name);
+        return cmd.ExecuteNonQuery() > 0;
     }
 
     /// <summary>Registers or updates a server-discovered hook (stand-in for the F6 hook-management admin UI).</summary>
@@ -66,6 +86,7 @@ public sealed class HookRepository
         HandlerPath = r.GetString(r.GetOrdinal("handler_path")),
         TimeoutSec = r.GetInt32(r.GetOrdinal("timeout_sec")),
         Enabled = r.GetInt64(r.GetOrdinal("enabled")) != 0,
+        Deleted = r.GetInt64(r.GetOrdinal("deleted")) != 0,
         CreatedAt = r.GetString(r.GetOrdinal("created_at")),
     };
 }

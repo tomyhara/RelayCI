@@ -1,5 +1,6 @@
 using System.Security.Claims;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using CiRunner.Core.Auth;
 using CiRunner.Core.Config;
 using CiRunner.Core.Data;
@@ -13,6 +14,23 @@ using Microsoft.AspNetCore.Authentication.Cookies;
 const string CookieScheme = "CiRunnerCookie";
 const string ApiTokenScheme = "ApiToken";
 const string SmartScheme = "Smart";
+
+// Job/hook names flow directly into on-disk paths (jobs/<name>/, hooks/<name>.cipipe) - restrict to
+// a safe charset so an admin-supplied name can never escape the jobs/hooks directory.
+var JobNamePattern = new Regex(@"^[A-Za-z0-9][A-Za-z0-9_.\-]*$");
+
+const string HookHandlerTemplate = """
+    # Webhook handler (spec §5 F1/F6). Restricted DSL surface: Get-HookPayload, Get-HookHeader,
+    # Start-CiJob, Exec only.
+    $payload = Get-HookPayload | ConvertFrom-Json
+    # Start-CiJob -Name "some-job" -Parameters @{ ref = $payload.ref }
+    """;
+
+const string PipelineTemplate = """
+    Stage "Build" {
+        Exec { Write-Host "TODO: replace with real build steps" }
+    }
+    """;
 
 var config = ConfigLoader.Load(args);
 var paths = new RunnerPaths(config.RootDir);
@@ -54,6 +72,7 @@ builder.Services.AddSingleton<HookRunRepository>();
 builder.Services.AddSingleton<UserRoleRepository>();
 builder.Services.AddSingleton<ApiTokenRepository>();
 builder.Services.AddSingleton<AuditLogRepository>();
+builder.Services.AddSingleton<ResourceDefRepository>();
 builder.Services.AddSingleton(authenticator);
 builder.Services.AddSingleton<LiveLogHub>();
 builder.Services.AddSingleton<GlobalEventHub>();
@@ -107,7 +126,8 @@ builder.Services.AddSingleton(sp =>
         sp.GetRequiredService<BuildRunner>(),
         sp.GetRequiredService<GlobalEventHub>(),
         executorLimit,
-        sp.GetRequiredService<RetentionService>());
+        sp.GetRequiredService<RetentionService>(),
+        sp.GetRequiredService<SettingsRepository>());
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<BuildDispatcher>());
 builder.Services.AddSingleton<JobTriggerService>();
@@ -128,12 +148,14 @@ builder.Services.AddSingleton(sp =>
 });
 builder.Services.AddSingleton(sp =>
 {
-    var intervalSec = sp.GetRequiredService<SettingsRepository>().GetInt("pollingIntervalSec", 60);
+    var settings = sp.GetRequiredService<SettingsRepository>();
+    var intervalSec = settings.GetInt("pollingIntervalSec", 60);
     return new PollingService(
         sp.GetRequiredService<JobRepository>(),
         sp.GetRequiredService<JobTriggerService>(),
         config.Git.ExePath,
-        intervalSec);
+        intervalSec,
+        settings);
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<PollingService>());
 builder.Services.AddSingleton<CronScheduler>();
@@ -304,6 +326,213 @@ app.MapDelete("/api/tokens/{id:long}", (long id, ApiTokenRepository tokens, Audi
 
 app.MapGet("/api/audit", (AuditLogRepository audit) => Results.Ok(audit.ListRecent(200)))
     .RequireAuthorization("Admin");
+
+// ---- F6: system settings (spec §5 F6 "システム設定") ----
+
+app.MapGet("/api/settings", (SettingsRepository settings) => Results.Ok(new
+{
+    executors = settings.GetInt("executors", 2),
+    defaultTimeoutMinutes = settings.GetInt("defaultTimeoutMinutes", 60),
+    defaultRetention = settings.GetInt("defaultRetention", 100),
+    pollingIntervalSec = settings.GetInt("pollingIntervalSec", 60),
+    testResultMode = settings.GetString("testResultMode", "strict"),
+    handlerConcurrency = settings.GetInt("handlerConcurrency", 4),
+})).RequireAuthorization("Admin");
+
+app.MapPost("/api/settings", (SettingsUpdateRequest? body, SettingsRepository settings, AuditLogRepository audit, ClaimsPrincipal actor) =>
+{
+    if (body is null) return Results.BadRequest(new { error = "request body required" });
+    if (body.Executors is { } ex && (ex < 1 || ex > 16)) return Results.BadRequest(new { error = "executors must be between 1 and 16" });
+    if (body.TestResultMode is { } trm && trm is not ("strict" or "exit-code-only")) return Results.BadRequest(new { error = "testResultMode must be strict or exit-code-only" });
+
+    var actorName = actor.Identity!.Name!;
+    var before = new Dictionary<string, string>();
+    var after = new Dictionary<string, string>();
+    void Apply(string key, string? value)
+    {
+        if (value is null) return;
+        before[key] = settings.GetString(key, "");
+        settings.Set(key, value, actorName);
+        after[key] = value;
+    }
+    Apply("executors", body.Executors?.ToString());
+    Apply("defaultTimeoutMinutes", body.DefaultTimeoutMinutes?.ToString());
+    Apply("defaultRetention", body.DefaultRetention?.ToString());
+    Apply("pollingIntervalSec", body.PollingIntervalSec?.ToString());
+    Apply("testResultMode", body.TestResultMode);
+    Apply("handlerConcurrency", body.HandlerConcurrency?.ToString());
+
+    if (after.Count > 0)
+    {
+        audit.Record(actorName, "settings.update", null, JsonSerializer.Serialize(before), JsonSerializer.Serialize(after));
+    }
+    return Results.Ok();
+}).RequireAuthorization("Admin");
+
+// ---- F6: job management (spec §5 F6 "ジョブ設定") ----
+// Jobs remain file-backed (jobs/<name>/job.json + pipeline.cipipe): every write here also mirrors
+// to disk so a later restart's JobScanner rescan reproduces the same state instead of clobbering it.
+
+app.MapGet("/api/admin/jobs", (JobRepository jobRepo) => Results.Ok(jobRepo.ListEnabled()))
+    .RequireAuthorization("Admin");
+
+app.MapGet("/api/admin/jobs/{name}", (string name, JobRepository jobRepo) =>
+{
+    var job = jobRepo.FindByName(name);
+    return job is null ? Results.NotFound() : Results.Ok(job);
+}).RequireAuthorization("Admin");
+
+app.MapPost("/api/admin/jobs", (JobAdminRequest? body, JobRepository jobRepo, RunnerPaths pathsSvc, AuditLogRepository audit, ClaimsPrincipal actor) =>
+{
+    if (string.IsNullOrWhiteSpace(body?.Name) || !JobNamePattern.IsMatch(body.Name))
+    {
+        return Results.BadRequest(new { error = "name is required and may only contain letters, digits, '.', '_', '-'" });
+    }
+    if (jobRepo.FindByName(body.Name) is not null)
+    {
+        return Results.Conflict(new { error = $"job '{body.Name}' already exists" });
+    }
+    var validationError = ValidateJobRequest(body);
+    if (validationError is not null) return Results.BadRequest(new { error = validationError });
+
+    jobRepo.Undelete(body.Name); // reactivate if this name belonged to a previously-deleted job
+    var job = ApplyJobConfig(pathsSvc, jobRepo, body.Name, body);
+    audit.Record(actor.Identity!.Name!, "job.create", body.Name, null, JsonSerializer.Serialize(job));
+    return Results.Ok(job);
+}).RequireAuthorization("Admin");
+
+app.MapPut("/api/admin/jobs/{name}", (string name, JobAdminRequest? body, JobRepository jobRepo, RunnerPaths pathsSvc, AuditLogRepository audit, ClaimsPrincipal actor) =>
+{
+    if (body is null) return Results.BadRequest(new { error = "request body required" });
+    var existing = jobRepo.FindByName(name);
+    if (existing is null) return Results.NotFound();
+    var validationError = ValidateJobRequest(body);
+    if (validationError is not null) return Results.BadRequest(new { error = validationError });
+
+    var beforeJson = JsonSerializer.Serialize(existing);
+    var job = ApplyJobConfig(pathsSvc, jobRepo, name, body);
+    audit.Record(actor.Identity!.Name!, "job.update", name, beforeJson, JsonSerializer.Serialize(job));
+    return Results.Ok(job);
+}).RequireAuthorization("Admin");
+
+app.MapDelete("/api/admin/jobs/{name}", (string name, JobRepository jobRepo, AuditLogRepository audit, ClaimsPrincipal actor) =>
+{
+    var existing = jobRepo.FindByName(name);
+    if (existing is null) return Results.NotFound();
+    jobRepo.SoftDelete(name);
+    audit.Record(actor.Identity!.Name!, "job.delete", name, JsonSerializer.Serialize(existing), null);
+    return Results.Ok();
+}).RequireAuthorization("Admin");
+
+app.MapGet("/api/admin/jobs/{name}/export", (string name, JobRepository jobRepo) =>
+{
+    var job = jobRepo.FindByName(name);
+    return job is null ? Results.NotFound() : Results.Ok(ToExportDto(job));
+}).RequireAuthorization("Admin");
+
+app.MapPost("/api/admin/jobs/import", (JobAdminRequest? body, JobRepository jobRepo, RunnerPaths pathsSvc, AuditLogRepository audit, ClaimsPrincipal actor) =>
+{
+    if (string.IsNullOrWhiteSpace(body?.Name) || !JobNamePattern.IsMatch(body.Name))
+    {
+        return Results.BadRequest(new { error = "name is required and may only contain letters, digits, '.', '_', '-'" });
+    }
+    var validationError = ValidateJobRequest(body);
+    if (validationError is not null) return Results.BadRequest(new { error = validationError });
+
+    var existing = jobRepo.FindByName(body.Name);
+    jobRepo.Undelete(body.Name); // reactivate if this name belonged to a previously-deleted job
+    var job = ApplyJobConfig(pathsSvc, jobRepo, body.Name, body);
+    audit.Record(actor.Identity!.Name!, existing is null ? "job.create" : "job.update", body.Name,
+        existing is null ? null : JsonSerializer.Serialize(existing), JsonSerializer.Serialize(job));
+    return Results.Ok(job);
+}).RequireAuthorization("Admin");
+
+// ---- F6: hook management (spec §5 F6 "フック管理") ----
+
+app.MapGet("/api/admin/hooks", (HookRepository hookRepo) => Results.Ok(hookRepo.ListEnabled().Select(MapHookForAdmin)))
+    .RequireAuthorization("Admin");
+
+app.MapGet("/api/admin/hooks/{name}", (string name, HookRepository hookRepo) =>
+{
+    var hook = hookRepo.FindByName(name);
+    return hook is null ? Results.NotFound() : Results.Ok(MapHookForAdmin(hook));
+}).RequireAuthorization("Admin");
+
+app.MapPost("/api/admin/hooks", (HookAdminCreateRequest? body, HookRepository hookRepo, RunnerPaths pathsSvc, AuditLogRepository audit, ClaimsPrincipal actor) =>
+{
+    if (string.IsNullOrWhiteSpace(body?.Name) || !JobNamePattern.IsMatch(body.Name))
+    {
+        return Results.BadRequest(new { error = "name is required and may only contain letters, digits, '.', '_', '-'" });
+    }
+    if (hookRepo.FindByName(body.Name) is not null)
+    {
+        return Results.Conflict(new { error = $"hook '{body.Name}' already exists" });
+    }
+
+    var handlerPath = pathsSvc.HookHandlerPath(body.Name);
+    Directory.CreateDirectory(pathsSvc.HooksDir);
+    if (!File.Exists(handlerPath))
+    {
+        File.WriteAllText(handlerPath, HookHandlerTemplate);
+    }
+    WriteHookConfig(pathsSvc, body.Name, body.Secret, body.TimeoutSec ?? 60, body.Enabled ?? true);
+    hookRepo.Undelete(body.Name); // reactivate if this name belonged to a previously-deleted hook
+    var hook = hookRepo.UpsertDiscoveredHook(body.Name, handlerPath, body.Secret, body.TimeoutSec ?? 60, body.Enabled ?? true);
+    audit.Record(actor.Identity!.Name!, "hook.create", body.Name, null, JsonSerializer.Serialize(MapHookForAdmin(hook)));
+    return Results.Ok(MapHookForAdmin(hook));
+}).RequireAuthorization("Admin");
+
+app.MapPut("/api/admin/hooks/{name}", (string name, HookAdminUpdateRequest? body, HookRepository hookRepo, RunnerPaths pathsSvc, AuditLogRepository audit, ClaimsPrincipal actor) =>
+{
+    if (body is null) return Results.BadRequest(new { error = "request body required" });
+    var existing = hookRepo.FindByName(name);
+    if (existing is null) return Results.NotFound();
+
+    var secret = body.Secret ?? existing.Secret;
+    var timeoutSec = body.TimeoutSec ?? existing.TimeoutSec;
+    var enabled = body.Enabled ?? existing.Enabled;
+    WriteHookConfig(pathsSvc, name, secret, timeoutSec, enabled);
+    var hook = hookRepo.UpsertDiscoveredHook(name, existing.HandlerPath, secret, timeoutSec, enabled);
+    audit.Record(actor.Identity!.Name!, "hook.update", name, JsonSerializer.Serialize(MapHookForAdmin(existing)), JsonSerializer.Serialize(MapHookForAdmin(hook)));
+    return Results.Ok(MapHookForAdmin(hook));
+}).RequireAuthorization("Admin");
+
+app.MapDelete("/api/admin/hooks/{name}", (string name, HookRepository hookRepo, AuditLogRepository audit, ClaimsPrincipal actor) =>
+{
+    var existing = hookRepo.FindByName(name);
+    if (existing is null) return Results.NotFound();
+    hookRepo.SoftDelete(name);
+    audit.Record(actor.Identity!.Name!, "hook.delete", name, JsonSerializer.Serialize(MapHookForAdmin(existing)), null);
+    return Results.Ok();
+}).RequireAuthorization("Admin");
+
+app.MapGet("/api/admin/hooks/{name}/runs", (string name, HookRepository hookRepo, HookRunRepository hookRunRepo) =>
+{
+    var hook = hookRepo.FindByName(name);
+    if (hook is null) return Results.NotFound();
+    return Results.Ok(hookRunRepo.ListRecent(hook.Id, 50));
+}).RequireAuthorization("Admin");
+
+// ---- F6: resource descriptions (spec §5 F3a/F6 "リソース"). Lock/wait state is F3a (runtime-only). ----
+
+app.MapGet("/api/admin/resources", (ResourceDefRepository resourceDefs) => Results.Ok(resourceDefs.ListAll()))
+    .RequireAuthorization("Admin");
+
+app.MapPost("/api/admin/resources", (ResourceDefRequest? body, ResourceDefRepository resourceDefs, AuditLogRepository audit, ClaimsPrincipal actor) =>
+{
+    if (string.IsNullOrWhiteSpace(body?.Name)) return Results.BadRequest(new { error = "name is required" });
+    var actorName = actor.Identity!.Name!;
+    var def = resourceDefs.Upsert(body.Name, body.Description, actorName);
+    audit.Record(actorName, "resource.upsert", body.Name, null, JsonSerializer.Serialize(def));
+    return Results.Ok(def);
+}).RequireAuthorization("Admin");
+
+app.MapDelete("/api/admin/resources/{name}", (string name, ResourceDefRepository resourceDefs, AuditLogRepository audit, ClaimsPrincipal actor) =>
+{
+    if (!resourceDefs.Delete(name)) return Results.NotFound();
+    audit.Record(actor.Identity!.Name!, "resource.delete", name, null, null);
+    return Results.Ok();
+}).RequireAuthorization("Admin");
 
 app.MapGet("/api/jobs", (JobRepository jobRepo, BuildRepository buildRepo) =>
 {
@@ -562,6 +791,98 @@ static object? MapBuildSummary(BuildRecord? b) => b is null ? null : new
     b.FinishedAt,
 };
 
+static string? ValidateJobRequest(JobAdminRequest body)
+{
+    if (body.PipelineSource is not (null or "server" or "repo"))
+    {
+        return "pipelineSource must be 'server' or 'repo'";
+    }
+    if (body.PipelineSource == "repo" && string.IsNullOrWhiteSpace(body.RepoUrl))
+    {
+        return "repoUrl is required when pipelineSource is 'repo'";
+    }
+    if (body.QueuePolicy is not (null or "queue" or "replace"))
+    {
+        return "queuePolicy must be 'queue' or 'replace'";
+    }
+    return null;
+}
+
+/// <summary>Applies a job create/update to both the DB and jobs/&lt;name&gt;/job.json, so the next
+/// JobScanner rescan (process restart) reproduces this state instead of clobbering it.</summary>
+static JobRecord ApplyJobConfig(RunnerPaths paths, JobRepository jobRepo, string name, JobAdminRequest body)
+{
+    var parameters = (body.Parameters ?? new List<JobParameterDef>())
+        .Where(p => !ParameterResolver.IsReservedName(p.Name))
+        .ToList();
+    var input = new JobConfigInput(
+        Name: name,
+        RepoUrl: body.RepoUrl,
+        WorkspacePath: body.WorkspacePath,
+        PipelineSource: body.PipelineSource ?? "server",
+        PipelinePath: body.PipelinePath ?? "pipeline.cipipe",
+        ParametersJson: JsonSerializer.Serialize(parameters),
+        CronSchedulesJson: JsonSerializer.Serialize(body.CronSchedules ?? new List<string>()),
+        PollingBranchesJson: body.PollingBranches is null ? null : JsonSerializer.Serialize(body.PollingBranches),
+        ResourcesJson: JsonSerializer.Serialize(body.Resources ?? new List<string>()),
+        QueuePolicy: body.QueuePolicy ?? "replace",
+        TimeoutMinutes: body.TimeoutMinutes,
+        Retention: body.Retention,
+        ShellPath: body.ShellPath,
+        Enabled: body.Enabled ?? true);
+
+    var job = jobRepo.UpsertConfiguredJob(input);
+
+    Directory.CreateDirectory(paths.JobDir(name));
+    File.WriteAllText(paths.JobConfigPath(name), JsonSerializer.Serialize(ToExportDto(job), new JsonSerializerOptions { WriteIndented = true }));
+
+    if (job.PipelineSource == "server" && !File.Exists(paths.JobPipelinePath(name)))
+    {
+        File.WriteAllText(paths.JobPipelinePath(name), PipelineTemplate);
+    }
+
+    return job;
+}
+
+static object ToExportDto(JobRecord job) => new
+{
+    name = job.Name,
+    repoUrl = job.RepoUrl,
+    workspacePath = job.WorkspacePath,
+    pipelineSource = job.PipelineSource,
+    pipelinePath = job.PipelinePath,
+    parameters = JsonSerializer.Deserialize<List<JobParameterDef>>(job.Parameters),
+    cronSchedules = JsonSerializer.Deserialize<List<string>>(job.CronSchedules),
+    pollingBranches = job.PollingBranches is null ? null : JsonSerializer.Deserialize<List<string>>(job.PollingBranches),
+    resources = JsonSerializer.Deserialize<List<string>>(job.Resources),
+    queuePolicy = job.QueuePolicy,
+    timeoutMinutes = job.TimeoutMinutes,
+    retention = job.Retention,
+    shellPath = job.ShellPath,
+    enabled = job.Enabled,
+};
+
+/// <summary>Never echoes the raw HMAC secret back through the API (spec §5 F6 "シークレット(値は伏せる)") -
+/// only whether one is set. The value stays usable server-side for webhook verification (WebhookReceiver
+/// reads HookRecord.Secret directly), it's just never re-served once written.</summary>
+static object MapHookForAdmin(HookRecord h) => new
+{
+    h.Id,
+    h.Name,
+    HasSecret = !string.IsNullOrEmpty(h.Secret),
+    h.HandlerPath,
+    h.TimeoutSec,
+    h.Enabled,
+    h.Deleted,
+    h.CreatedAt,
+};
+
+static void WriteHookConfig(RunnerPaths paths, string name, string? secret, int timeoutSec, bool enabled)
+{
+    Directory.CreateDirectory(paths.HooksDir);
+    File.WriteAllText(paths.HookConfigPath(name), JsonSerializer.Serialize(new { secret, timeoutSec, enabled }, new JsonSerializerOptions { WriteIndented = true }));
+}
+
 sealed class TriggerRequest
 {
     public Dictionary<string, string>? Parameters { get; set; }
@@ -589,4 +910,54 @@ sealed class IssueTokenRequest
 {
     public string? Name { get; set; }
     public string? Role { get; set; }
+}
+
+sealed class SettingsUpdateRequest
+{
+    public int? Executors { get; set; }
+    public int? DefaultTimeoutMinutes { get; set; }
+    public int? DefaultRetention { get; set; }
+    public int? PollingIntervalSec { get; set; }
+    public string? TestResultMode { get; set; }
+    public int? HandlerConcurrency { get; set; }
+}
+
+/// <summary>Body shape for job create/update/import. Name is required for create/import and ignored on update (the route provides it).</summary>
+sealed class JobAdminRequest
+{
+    public string? Name { get; set; }
+    public string? RepoUrl { get; set; }
+    public string? WorkspacePath { get; set; }
+    public string? PipelineSource { get; set; }
+    public string? PipelinePath { get; set; }
+    public List<JobParameterDef>? Parameters { get; set; }
+    public List<string>? CronSchedules { get; set; }
+    public List<string>? PollingBranches { get; set; }
+    public List<string>? Resources { get; set; }
+    public string? QueuePolicy { get; set; }
+    public int? TimeoutMinutes { get; set; }
+    public int? Retention { get; set; }
+    public string? ShellPath { get; set; }
+    public bool? Enabled { get; set; }
+}
+
+sealed class HookAdminCreateRequest
+{
+    public string? Name { get; set; }
+    public string? Secret { get; set; }
+    public int? TimeoutSec { get; set; }
+    public bool? Enabled { get; set; }
+}
+
+sealed class HookAdminUpdateRequest
+{
+    public string? Secret { get; set; }
+    public int? TimeoutSec { get; set; }
+    public bool? Enabled { get; set; }
+}
+
+sealed class ResourceDefRequest
+{
+    public string? Name { get; set; }
+    public string? Description { get; set; }
 }

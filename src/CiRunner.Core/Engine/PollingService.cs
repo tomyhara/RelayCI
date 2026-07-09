@@ -15,16 +15,21 @@ public sealed class PollingService : BackgroundService
     private readonly JobRepository _jobRepo;
     private readonly JobTriggerService _triggerService;
     private readonly string _gitExePath;
-    private readonly TimeSpan _interval;
+    private readonly int _intervalSec;
+    private readonly SettingsRepository? _settings;
     private readonly Dictionary<string, string> _lastKnownSha = new();
 
-    public PollingService(JobRepository jobRepo, JobTriggerService triggerService, string gitExePath, int intervalSec)
+    public PollingService(JobRepository jobRepo, JobTriggerService triggerService, string gitExePath, int intervalSec, SettingsRepository? settings = null)
     {
         _jobRepo = jobRepo;
         _triggerService = triggerService;
         _gitExePath = gitExePath;
-        _interval = TimeSpan.FromSeconds(Math.Max(5, intervalSec));
+        _intervalSec = intervalSec;
+        _settings = settings;
     }
+
+    /// <summary>Read live each loop iteration so a settings change applies without a restart (spec §5 F6).</summary>
+    private TimeSpan CurrentInterval => TimeSpan.FromSeconds(Math.Max(5, _settings?.GetInt("pollingIntervalSec", _intervalSec) ?? _intervalSec));
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -41,7 +46,7 @@ public sealed class PollingService : BackgroundService
 
             try
             {
-                await Task.Delay(_interval, stoppingToken);
+                await Task.Delay(CurrentInterval, stoppingToken);
             }
             catch (OperationCanceledException)
             {

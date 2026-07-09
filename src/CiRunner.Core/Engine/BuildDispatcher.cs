@@ -16,13 +16,14 @@ public sealed class BuildDispatcher : BackgroundService
     private readonly GlobalEventHub _eventHub;
     private readonly RetentionService? _retentionService;
     private readonly int _executorLimit;
+    private readonly SettingsRepository? _settings;
 
     private readonly object _stateLock = new();
     private readonly HashSet<long> _runningJobIds = new();
     private int _activeExecutors;
     private readonly SemaphoreSlim _wake = new(1);
 
-    public BuildDispatcher(BuildRepository buildRepo, JobRepository jobRepo, BuildRunner buildRunner, GlobalEventHub eventHub, int executorLimit = 2, RetentionService? retentionService = null)
+    public BuildDispatcher(BuildRepository buildRepo, JobRepository jobRepo, BuildRunner buildRunner, GlobalEventHub eventHub, int executorLimit = 2, RetentionService? retentionService = null, SettingsRepository? settings = null)
     {
         _buildRepo = buildRepo;
         _jobRepo = jobRepo;
@@ -30,7 +31,15 @@ public sealed class BuildDispatcher : BackgroundService
         _eventHub = eventHub;
         _retentionService = retentionService;
         _executorLimit = executorLimit;
+        _settings = settings;
     }
+
+    /// <summary>
+    /// Read live from settings on every dispatch tick when available, so a system-settings change
+    /// (spec §5 F6 "再起動不要で即時反映") applies without restarting the runner. Falls back to the
+    /// fixed constructor value when no SettingsRepository was supplied (e.g. unit tests).
+    /// </summary>
+    private int CurrentExecutorLimit => _settings?.GetInt("executors", _executorLimit) ?? _executorLimit;
 
     /// <summary>Wakes the dispatch loop immediately instead of waiting for the next poll tick.</summary>
     public void Signal()
@@ -71,7 +80,7 @@ public sealed class BuildDispatcher : BackgroundService
 
             lock (_stateLock)
             {
-                if (_activeExecutors >= _executorLimit)
+                if (_activeExecutors >= CurrentExecutorLimit)
                 {
                     break;
                 }

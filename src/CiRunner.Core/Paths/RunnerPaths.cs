@@ -24,6 +24,7 @@ public sealed class RunnerPaths
 
     public string JobDir(string jobName) => Path.Combine(JobsDir, jobName);
     public string JobPipelinePath(string jobName) => Path.Combine(JobDir(jobName), "pipeline.cipipe");
+    public string JobConfigPath(string jobName) => Path.Combine(JobDir(jobName), "job.json");
     public string JobWorkspaceDir(string jobName) => Path.Combine(WorkspacesDir, jobName);
     public string JobLogsDir(string jobName) => Path.Combine(LogsDir, jobName);
     public string BuildLogPath(string jobName, int buildNumber) => Path.Combine(JobLogsDir(jobName), $"{buildNumber}.log");

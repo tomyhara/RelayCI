@@ -130,7 +130,9 @@ public sealed class BuildRunner
 
         using var process = new Process { StartInfo = psi, EnableRaisingEvents = true };
 
-        var timeout = job.TimeoutMinutes is > 0 ? TimeSpan.FromMinutes(job.TimeoutMinutes.Value) : DefaultTimeout;
+        var timeout = job.TimeoutMinutes is > 0
+            ? TimeSpan.FromMinutes(job.TimeoutMinutes.Value)
+            : TimeSpan.FromMinutes(_settings.GetInt("defaultTimeoutMinutes", (int)DefaultTimeout.TotalMinutes));
         using var timeoutCts = new CancellationTokenSource(timeout);
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
 

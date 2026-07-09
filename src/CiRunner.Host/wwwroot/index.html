@@ -167,6 +167,14 @@ h1{font-size:22px;margin:0 0 3px}
 .usermenu .mi{padding:8px 10px;border-radius:7px;font-size:12.5px;cursor:pointer;color:var(--text-2)}
 .usermenu .mi:hover{background:var(--surface-2);color:var(--text)}
 .rolesel{padding:5px 8px;border-radius:6px;background:var(--surface-2);border:1px solid var(--border);color:var(--text);font-size:12px}
+.formgrid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.formgrid .full{grid-column:1/-1}
+.formgrid label{display:block;font-size:11.5px;color:var(--text-2);margin-bottom:5px}
+.formgrid input[type=text],.formgrid input[type=number],.formgrid input[type=password],.formgrid select,.formgrid textarea{width:100%;padding:7px 9px;background:var(--surface-2);border:1px solid var(--border);border-radius:7px;color:var(--text);font-size:12.5px;font-family:inherit}
+.formgrid textarea{min-height:64px;resize:vertical;font-family:ui-monospace,monospace}
+.formrow-check{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--text-2)}
+.paramrow{display:grid;grid-template-columns:1fr 1fr 1.4fr auto auto;gap:8px;margin-bottom:6px;align-items:center}
+.paramrow input{padding:6px 8px;background:var(--surface-2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px}
 </style>
 </head>
 <body>
@@ -844,8 +852,14 @@ async function renderQueue(){
 
 /* ================= ADMIN ================= */
 route('/admin', renderAdmin);
-let adminTab = 'users';
-function switchAdminTab(id){ adminTab = id; renderAdmin(); }
+let adminTab = 'settings';
+function switchAdminTab(id){
+  adminTab = id;
+  jobFormEditingName = null;
+  hookFormEditingName = null;
+  hookRunsViewingName = null;
+  renderAdmin();
+}
 
 async function renderAdmin(){
   const main = document.getElementById('main');
@@ -856,6 +870,9 @@ async function renderAdmin(){
     <h1 class="display">Admin</h1>
     <p class="sub" style="margin-bottom:20px">User roles and API tokens (spec §9)</p>
     <div class="tabbar">
+      <div class="tab ${adminTab==='settings'?'active':''}" onclick="switchAdminTab('settings')">Settings</div>
+      <div class="tab ${adminTab==='jobs'?'active':''}" onclick="switchAdminTab('jobs')">Jobs</div>
+      <div class="tab ${adminTab==='hooks'?'active':''}" onclick="switchAdminTab('hooks')">Hooks</div>
       <div class="tab ${adminTab==='users'?'active':''}" onclick="switchAdminTab('users')">Users</div>
       <div class="tab ${adminTab==='tokens'?'active':''}" onclick="switchAdminTab('tokens')">API Tokens</div>
       <div class="tab ${adminTab==='audit'?'active':''}" onclick="switchAdminTab('audit')">Audit Log</div>
@@ -864,7 +881,10 @@ async function renderAdmin(){
   </div>`;
 
   const el = document.getElementById('admin-content');
-  if (adminTab === 'tokens') renderAdminTokens(el);
+  if (adminTab === 'settings') renderAdminSettings(el);
+  else if (adminTab === 'jobs') renderAdminJobs(el);
+  else if (adminTab === 'hooks') renderAdminHooks(el);
+  else if (adminTab === 'tokens') renderAdminTokens(el);
   else if (adminTab === 'audit') renderAdminAudit(el);
   else renderAdminUsers(el);
 }
@@ -978,6 +998,314 @@ async function revokeToken(id){
   if (!confirm('Revoke this token? Any client using it will immediately lose access.')) return;
   await fetch(`/api/tokens/${id}`, { method: 'DELETE' });
   renderAdmin();
+}
+
+/* ================= ADMIN: SETTINGS ================= */
+async function renderAdminSettings(el){
+  const s = await api('/api/settings');
+  el.innerHTML = `
+    <div class="card" style="padding:16px 18px;max-width:640px">
+      <div class="formgrid">
+        <div><label>Executors (1-16)</label><input type="number" id="st-executors" min="1" max="16" value="${s.executors}"></div>
+        <div><label>Default build timeout (minutes)</label><input type="number" id="st-timeout" value="${s.defaultTimeoutMinutes}"></div>
+        <div><label>Default log/artifact retention (builds)</label><input type="number" id="st-retention" value="${s.defaultRetention}"></div>
+        <div><label>Default polling interval (seconds)</label><input type="number" id="st-polling" value="${s.pollingIntervalSec}"></div>
+        <div><label>Test result mode</label>
+          <select id="st-testmode">
+            <option value="strict" ${s.testResultMode==='strict'?'selected':''}>strict (any failed test fails the build)</option>
+            <option value="exit-code-only" ${s.testResultMode==='exit-code-only'?'selected':''}>exit-code-only</option>
+          </select>
+        </div>
+        <div><label>Handler concurrency</label><input type="number" id="st-handlerconc" value="${s.handlerConcurrency}"></div>
+      </div>
+      <div class="login-error" id="st-error" style="display:none;margin-top:12px"></div>
+      <button class="btn primary" style="margin-top:16px" onclick="saveSettings()">Save</button>
+    </div>`;
+}
+
+async function saveSettings(){
+  const errEl = document.getElementById('st-error');
+  errEl.style.display = 'none';
+  const body = {
+    executors: Number(document.getElementById('st-executors').value),
+    defaultTimeoutMinutes: Number(document.getElementById('st-timeout').value),
+    defaultRetention: Number(document.getElementById('st-retention').value),
+    pollingIntervalSec: Number(document.getElementById('st-polling').value),
+    testResultMode: document.getElementById('st-testmode').value,
+    handlerConcurrency: Number(document.getElementById('st-handlerconc').value),
+  };
+  const res = await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  if (!res.ok) {
+    const b = await res.json().catch(() => ({}));
+    errEl.textContent = b.error || `Failed (${res.status})`;
+    errEl.style.display = 'block';
+    return;
+  }
+  renderAdmin();
+}
+
+/* ================= ADMIN: JOBS ================= */
+let jobFormParameters = [];
+let jobFormEditingName = null; // null = list view, '' = new job, otherwise the job being edited
+
+async function renderAdminJobs(el){
+  if (jobFormEditingName !== null) { await renderJobForm(el); return; }
+
+  const jobs = await api('/api/admin/jobs');
+  el.innerHTML = `
+    <div style="display:flex;justify-content:flex-end;gap:8px;margin-bottom:12px">
+      <button class="btn" onclick="importJobPrompt()">Import JSON</button>
+      <button class="btn primary" onclick="newJobForm()">New Job</button>
+    </div>
+    <div class="card">
+      <div class="thead" style="grid-template-columns:1.4fr 100px 100px 1fr 90px"><div>Name</div><div>Source</div><div>Enabled</div><div>Resources</div><div></div></div>
+      <div>${jobs.length === 0 ? `<div style="padding:16px" class="sub">No jobs configured yet.</div>` : jobs.map(j => `
+        <div class="trow" style="grid-template-columns:1.4fr 100px 100px 1fr 90px">
+          <div style="font-weight:600;cursor:pointer" onclick="editJobForm('${esc(j.name)}')">${esc(j.name)}</div>
+          <div class="mono sub">${esc(j.pipelineSource)}</div>
+          <div>${j.enabled ? '<span class="sub">yes</span>' : '<span style="color:var(--st-failed)">no</span>'}</div>
+          <div class="mono sub" style="font-size:11px">${esc((JSON.parse(j.resources||'[]')).join(', '))}</div>
+          <div style="text-align:right;display:flex;gap:6px;justify-content:flex-end">
+            <button class="btn" style="padding:5px 10px;font-size:12px" onclick="exportJob('${esc(j.name)}')">Export</button>
+            <button class="btn danger" style="padding:5px 10px;font-size:12px" onclick="deleteJobAdmin('${esc(j.name)}')">Delete</button>
+          </div>
+        </div>`).join('')}</div>
+    </div>`;
+}
+
+function newJobForm(){ jobFormEditingName = ''; jobFormParameters = []; renderAdmin(); }
+function closeJobForm(){ jobFormEditingName = null; renderAdmin(); }
+
+async function editJobForm(name){
+  const job = await api(`/api/admin/jobs/${encodeURIComponent(name)}`);
+  jobFormParameters = JSON.parse(job.parameters || '[]').map(p => ({ name: p.Name, default: p.Default, description: p.Description, required: !!p.Required }));
+  jobFormEditingName = name;
+  renderAdmin();
+}
+
+async function renderJobForm(el){
+  const isEdit = !!jobFormEditingName;
+  const job = isEdit ? await api(`/api/admin/jobs/${encodeURIComponent(jobFormEditingName)}`) : null;
+  const cronList = job ? JSON.parse(job.cronSchedules || '[]') : [];
+  const pollList = job && job.pollingBranches ? JSON.parse(job.pollingBranches) : [];
+  const resourcesList = job ? JSON.parse(job.resources || '[]') : [];
+
+  el.innerHTML = `
+    <div class="card" style="padding:16px 18px;max-width:760px">
+      <div class="formgrid">
+        <div class="full"><label>Name</label><input type="text" id="jf-name" ${isEdit ? 'disabled' : ''} value="${esc(isEdit ? job.name : '')}" placeholder="my-job"></div>
+        <div><label>Repo URL (optional)</label><input type="text" id="jf-repoUrl" value="${esc(job?.repoUrl || '')}"></div>
+        <div><label>Workspace Path (optional)</label><input type="text" id="jf-workspacePath" value="${esc(job?.workspacePath || '')}"></div>
+        <div><label>Pipeline Source</label>
+          <select id="jf-pipelineSource">
+            <option value="server" ${(!job || job.pipelineSource==='server')?'selected':''}>server</option>
+            <option value="repo" ${job?.pipelineSource==='repo'?'selected':''}>repo</option>
+          </select>
+        </div>
+        <div><label>Pipeline Path</label><input type="text" id="jf-pipelinePath" value="${esc(job?.pipelinePath || 'pipeline.cipipe')}"></div>
+        <div><label>Queue Policy</label>
+          <select id="jf-queuePolicy">
+            <option value="replace" ${(!job || job.queuePolicy==='replace')?'selected':''}>replace</option>
+            <option value="queue" ${job?.queuePolicy==='queue'?'selected':''}>queue</option>
+          </select>
+        </div>
+        <div><label>Shell Path (optional)</label><input type="text" id="jf-shellPath" value="${esc(job?.shellPath || '')}" placeholder="powershell.exe"></div>
+        <div><label>Timeout override (minutes)</label><input type="number" id="jf-timeoutMinutes" value="${job?.timeoutMinutes ?? ''}" placeholder="system default"></div>
+        <div><label>Retention override (builds)</label><input type="number" id="jf-retention" value="${job?.retention ?? ''}" placeholder="system default"></div>
+        <div class="formrow-check" style="padding-top:22px"><input type="checkbox" id="jf-enabled" ${(!job || job.enabled) ? 'checked' : ''}> <label style="margin:0" for="jf-enabled">Enabled</label></div>
+        <div class="full"><label>Cron Schedules (one per line)</label><textarea id="jf-cron">${esc(cronList.join('\n'))}</textarea></div>
+        <div class="full"><label>Polling Branches (one per line)</label><textarea id="jf-polling">${esc(pollList.join('\n'))}</textarea></div>
+        <div class="full"><label>Resources (comma separated)</label><input type="text" id="jf-resources" value="${esc(resourcesList.join(', '))}"></div>
+        <div class="full">
+          <label>Parameters</label>
+          <div id="jf-params"></div>
+          <button type="button" class="btn" style="padding:5px 10px;font-size:12px" onclick="addJobParamRow()">+ Add parameter</button>
+        </div>
+      </div>
+      <div class="login-error" id="jf-error" style="display:none;margin-top:12px"></div>
+      <div style="display:flex;gap:8px;margin-top:16px">
+        <button class="btn primary" onclick="saveJobForm()">Save</button>
+        <button class="btn" onclick="closeJobForm()">Cancel</button>
+      </div>
+    </div>`;
+  renderJobParamRows();
+}
+
+function renderJobParamRows(){
+  document.getElementById('jf-params').innerHTML = jobFormParameters.map((p, i) => `
+    <div class="paramrow">
+      <input placeholder="name" value="${esc(p.name || '')}" oninput="jobFormParameters[${i}].name=this.value">
+      <input placeholder="default" value="${esc(p.default || '')}" oninput="jobFormParameters[${i}].default=this.value">
+      <input placeholder="description" value="${esc(p.description || '')}" oninput="jobFormParameters[${i}].description=this.value">
+      <label class="formrow-check"><input type="checkbox" ${p.required?'checked':''} onchange="jobFormParameters[${i}].required=this.checked"> required</label>
+      <button type="button" class="btn danger" style="padding:4px 8px;font-size:11px" onclick="removeJobParamRow(${i})">✕</button>
+    </div>`).join('') || `<div class="sub" style="font-size:11.5px;margin-bottom:6px">No parameters defined.</div>`;
+}
+function addJobParamRow(){ jobFormParameters.push({ name: '', default: '', description: '', required: false }); renderJobParamRows(); }
+function removeJobParamRow(i){ jobFormParameters.splice(i, 1); renderJobParamRows(); }
+
+function readJobFormBody(){
+  return {
+    name: document.getElementById('jf-name').value.trim(),
+    repoUrl: document.getElementById('jf-repoUrl').value.trim() || null,
+    workspacePath: document.getElementById('jf-workspacePath').value.trim() || null,
+    pipelineSource: document.getElementById('jf-pipelineSource').value,
+    pipelinePath: document.getElementById('jf-pipelinePath').value.trim() || null,
+    queuePolicy: document.getElementById('jf-queuePolicy').value,
+    shellPath: document.getElementById('jf-shellPath').value.trim() || null,
+    timeoutMinutes: document.getElementById('jf-timeoutMinutes').value ? Number(document.getElementById('jf-timeoutMinutes').value) : null,
+    retention: document.getElementById('jf-retention').value ? Number(document.getElementById('jf-retention').value) : null,
+    enabled: document.getElementById('jf-enabled').checked,
+    cronSchedules: document.getElementById('jf-cron').value.split('\n').map(s => s.trim()).filter(Boolean),
+    pollingBranches: document.getElementById('jf-polling').value.split('\n').map(s => s.trim()).filter(Boolean),
+    resources: document.getElementById('jf-resources').value.split(',').map(s => s.trim()).filter(Boolean),
+    parameters: jobFormParameters.filter(p => p.name).map(p => ({ Name: p.name, Default: p.default || null, Description: p.description || null, Required: !!p.required })),
+  };
+}
+
+async function saveJobForm(){
+  const body = readJobFormBody();
+  const errEl = document.getElementById('jf-error');
+  errEl.style.display = 'none';
+  if (!body.name) { errEl.textContent = 'Name is required.'; errEl.style.display = 'block'; return; }
+
+  const isEdit = !!jobFormEditingName;
+  const url = isEdit ? `/api/admin/jobs/${encodeURIComponent(jobFormEditingName)}` : '/api/admin/jobs';
+  const res = await fetch(url, { method: isEdit ? 'PUT' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  if (!res.ok) {
+    const b = await res.json().catch(() => ({}));
+    errEl.textContent = b.error || `Failed (${res.status})`;
+    errEl.style.display = 'block';
+    return;
+  }
+  jobFormEditingName = null;
+  renderAdmin();
+}
+
+async function deleteJobAdmin(name){
+  if (!confirm(`Delete job “${name}”? Build history is kept until it ages out of retention.`)) return;
+  await fetch(`/api/admin/jobs/${encodeURIComponent(name)}`, { method: 'DELETE' });
+  renderAdmin();
+}
+
+async function exportJob(name){
+  const dto = await api(`/api/admin/jobs/${encodeURIComponent(name)}/export`);
+  prompt('Job definition (copy this JSON):', JSON.stringify(dto));
+}
+
+async function importJobPrompt(){
+  const text = prompt('Paste an exported job definition JSON:');
+  if (!text) return;
+  let dto;
+  try { dto = JSON.parse(text); } catch (e) { alert('Invalid JSON.'); return; }
+  const res = await fetch('/api/admin/jobs/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(dto) });
+  if (!res.ok) { const b = await res.json().catch(() => ({})); alert(b.error || `Failed (${res.status})`); return; }
+  renderAdmin();
+}
+
+/* ================= ADMIN: HOOKS ================= */
+let hookFormEditingName = null; // null = list view, '' = new hook, otherwise the hook being edited
+let hookRunsViewingName = null;
+
+async function renderAdminHooks(el){
+  if (hookRunsViewingName !== null) { await renderHookRuns(el); return; }
+  if (hookFormEditingName !== null) { await renderHookForm(el); return; }
+
+  const hooks = await api('/api/admin/hooks');
+  el.innerHTML = `
+    <div style="display:flex;justify-content:flex-end;margin-bottom:12px">
+      <button class="btn primary" onclick="newHookForm()">New Hook</button>
+    </div>
+    <div class="card">
+      <div class="thead" style="grid-template-columns:1.4fr 100px 90px 100px 150px"><div>Name</div><div>Secret</div><div>Timeout</div><div>Enabled</div><div></div></div>
+      <div>${hooks.length === 0 ? `<div style="padding:16px" class="sub">No hooks configured yet. POST to /api/webhook/&lt;name&gt; once created.</div>` : hooks.map(h => `
+        <div class="trow" style="grid-template-columns:1.4fr 100px 90px 100px 150px">
+          <div style="font-weight:600;cursor:pointer" onclick="editHookForm('${esc(h.name)}')">${esc(h.name)}</div>
+          <div class="sub">${h.hasSecret ? '••••••••' : '(none)'}</div>
+          <div class="mono sub">${h.timeoutSec}s</div>
+          <div>${h.enabled ? '<span class="sub">yes</span>' : '<span style="color:var(--st-failed)">no</span>'}</div>
+          <div style="text-align:right;display:flex;gap:6px;justify-content:flex-end">
+            <button class="btn" style="padding:5px 10px;font-size:12px" onclick="viewHookRuns('${esc(h.name)}')">History</button>
+            <button class="btn danger" style="padding:5px 10px;font-size:12px" onclick="deleteHookAdmin('${esc(h.name)}')">Delete</button>
+          </div>
+        </div>`).join('')}</div>
+    </div>`;
+}
+
+function newHookForm(){ hookFormEditingName = ''; renderAdmin(); }
+function closeHookForm(){ hookFormEditingName = null; renderAdmin(); }
+function editHookForm(name){ hookFormEditingName = name; renderAdmin(); }
+
+async function renderHookForm(el){
+  const isEdit = !!hookFormEditingName;
+  const hook = isEdit ? await api(`/api/admin/hooks/${encodeURIComponent(hookFormEditingName)}`) : null;
+  el.innerHTML = `
+    <div class="card" style="padding:16px 18px;max-width:520px">
+      <div class="formgrid">
+        <div class="full"><label>Name</label><input type="text" id="hf-name" ${isEdit ? 'disabled' : ''} value="${esc(isEdit ? hook.name : '')}" placeholder="github-push"></div>
+        <div class="full"><label>Secret ${isEdit ? '(leave blank to keep existing)' : '(HMAC signing secret, optional)'}</label><input type="password" id="hf-secret" placeholder="${isEdit && hook.hasSecret ? '(unchanged)' : ''}"></div>
+        <div><label>Timeout (seconds)</label><input type="number" id="hf-timeout" value="${hook?.timeoutSec ?? 60}"></div>
+        <div class="formrow-check" style="padding-top:22px"><input type="checkbox" id="hf-enabled" ${(!hook || hook.enabled) ? 'checked' : ''}> <label style="margin:0" for="hf-enabled">Enabled</label></div>
+      </div>
+      <div class="hint" style="margin-top:12px">Endpoint: <span class="mono">POST /api/webhook/${esc(isEdit ? hookFormEditingName : '<name>')}</span>. Handler script: <span class="mono">hooks/${esc(isEdit ? hookFormEditingName : '<name>')}.cipipe</span></div>
+      <div class="login-error" id="hf-error" style="display:none;margin-top:12px"></div>
+      <div style="display:flex;gap:8px;margin-top:16px">
+        <button class="btn primary" onclick="saveHookForm()">Save</button>
+        <button class="btn" onclick="closeHookForm()">Cancel</button>
+      </div>
+    </div>`;
+}
+
+async function saveHookForm(){
+  const isEdit = !!hookFormEditingName;
+  const name = isEdit ? hookFormEditingName : document.getElementById('hf-name').value.trim();
+  const secretInput = document.getElementById('hf-secret').value;
+  const errEl = document.getElementById('hf-error');
+  errEl.style.display = 'none';
+  if (!name) { errEl.textContent = 'Name is required.'; errEl.style.display = 'block'; return; }
+
+  const body = {
+    timeoutSec: Number(document.getElementById('hf-timeout').value) || 60,
+    enabled: document.getElementById('hf-enabled').checked,
+  };
+  if (!isEdit) body.name = name;
+  if (secretInput) body.secret = secretInput; // blank on edit = keep existing; blank on create = no secret
+
+  const url = isEdit ? `/api/admin/hooks/${encodeURIComponent(name)}` : '/api/admin/hooks';
+  const res = await fetch(url, { method: isEdit ? 'PUT' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  if (!res.ok) {
+    const b = await res.json().catch(() => ({}));
+    errEl.textContent = b.error || `Failed (${res.status})`;
+    errEl.style.display = 'block';
+    return;
+  }
+  hookFormEditingName = null;
+  renderAdmin();
+}
+
+async function deleteHookAdmin(name){
+  if (!confirm(`Delete hook “${name}”? Run history is kept.`)) return;
+  await fetch(`/api/admin/hooks/${encodeURIComponent(name)}`, { method: 'DELETE' });
+  renderAdmin();
+}
+
+function viewHookRuns(name){ hookRunsViewingName = name; renderAdmin(); }
+function closeHookRuns(){ hookRunsViewingName = null; renderAdmin(); }
+
+async function renderHookRuns(el){
+  const runs = await api(`/api/admin/hooks/${encodeURIComponent(hookRunsViewingName)}/runs`);
+  el.innerHTML = `
+    <div class="crumb"><span class="link" onclick="closeHookRuns()">hooks</span> / <span>${esc(hookRunsViewingName)} runs</span></div>
+    <div class="card">
+      <div class="thead" style="grid-template-columns:150px 100px 100px 1fr"><div>Received</div><div>Event</div><div>Status</div><div>Triggered builds</div></div>
+      <div>${runs.length === 0 ? `<div style="padding:16px" class="sub">No deliveries recorded yet.</div>` : runs.map(r => `
+        <div class="trow" style="grid-template-columns:150px 100px 100px 1fr">
+          <div class="mono sub" style="font-size:11px">${fmtRelative(r.receivedAt)}</div>
+          <div class="mono sub">${esc(r.event || '–')}</div>
+          <div>${statusBadge(r.status === 'success' ? 'success' : (r.status === 'running' ? 'running' : 'failed'))}</div>
+          <div class="mono sub" style="font-size:11px">${(JSON.parse(r.triggeredBuilds || '[]')).map(id => `<span class="link" onclick="navigate('/builds/${id}')">#${id}</span>`).join(', ') || '–'}</div>
+        </div>`).join('')}</div>
+    </div>`;
 }
 
 /* ---------- global SSE: keep current view fresh ---------- */
