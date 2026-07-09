@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="6.0.0" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
+    <PackageReference Include="xunit" Version="2.5.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.5.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Not used at compile time; forces `dotnet test` to build the real Host app first and copies
+         CiRunner.Host.dll (+ deps.json/runtimeconfig.json) next to this test assembly, so
+         HostProcess can launch the actual Kestrel-hosted app as a real subprocess
+         (ci-runner-test-spec.md §3 "L3: ... 実 Kestrel をランダムポートで起動"). -->
+    <ProjectReference Include="..\..\src\CiRunner.Host\CiRunner.Host.csproj" />
+  </ItemGroup>
+
+</Project>

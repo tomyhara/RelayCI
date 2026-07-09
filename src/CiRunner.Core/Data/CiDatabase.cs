@@ -165,6 +165,20 @@ public sealed class CiDatabase
             size INTEGER
         );
 
+        -- Not in the spec's §7 listing but required by §5 F6 / §9 ("APIトークン" admin screen):
+        -- admin-issued Bearer tokens for scripts. Only a salted hash of the token is stored -
+        -- the raw value is shown once at issuance and is not recoverable afterward.
+        CREATE TABLE IF NOT EXISTS api_tokens (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            token_hash TEXT UNIQUE NOT NULL,
+            role TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            last_used_at TEXT,
+            revoked_at TEXT
+        );
+
         CREATE INDEX IF NOT EXISTS idx_builds_job ON builds(job_id, number);
         CREATE INDEX IF NOT EXISTS idx_build_steps_build ON build_steps(build_id, seq);
         CREATE INDEX IF NOT EXISTS idx_test_results_build ON test_results(build_id);

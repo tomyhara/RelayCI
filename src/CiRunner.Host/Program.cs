@@ -1,13 +1,40 @@
+using System.Security.Claims;
 using System.Text.Json;
+using CiRunner.Core.Auth;
 using CiRunner.Core.Config;
 using CiRunner.Core.Data;
 using CiRunner.Core.Engine;
 using CiRunner.Core.Models;
 using CiRunner.Core.Paths;
+using CiRunner.Host.Auth;
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authentication.Cookies;
+
+const string CookieScheme = "CiRunnerCookie";
+const string ApiTokenScheme = "ApiToken";
+const string SmartScheme = "Smart";
 
 var config = ConfigLoader.Load(args);
 var paths = new RunnerPaths(config.RootDir);
 paths.EnsureCreated();
+
+// auth.localUsers (spec §9 "テスト用認証") substitutes for a real LDAP server in automated tests.
+// It must never be reachable in a Release build - refuse to start rather than silently ignore it.
+#if !DEBUG
+if (config.Auth.LocalUsers is { Count: > 0 })
+{
+    throw new InvalidOperationException("auth.localUsers is a Debug-build-only setting (spec §9); refusing to start a Release build with this key set.");
+}
+#endif
+
+IAuthenticator authenticator =
+#if DEBUG
+    config.Auth.LocalUsers is { Count: > 0 }
+        ? new LocalUsersAuthenticator(config.Auth.LocalUsers)
+        : new LdapAuthenticator(config.Auth.Ldap);
+#else
+    new LdapAuthenticator(config.Auth.Ldap);
+#endif
 
 var builder = WebApplication.CreateBuilder(args);
 builder.WebHost.UseUrls($"http://{config.Bind}:{config.Port}");
@@ -24,10 +51,41 @@ builder.Services.AddSingleton<ArtifactRepository>();
 builder.Services.AddSingleton<SettingsRepository>();
 builder.Services.AddSingleton<HookRepository>();
 builder.Services.AddSingleton<HookRunRepository>();
+builder.Services.AddSingleton<UserRoleRepository>();
+builder.Services.AddSingleton<ApiTokenRepository>();
+builder.Services.AddSingleton<AuditLogRepository>();
+builder.Services.AddSingleton(authenticator);
 builder.Services.AddSingleton<LiveLogHub>();
 builder.Services.AddSingleton<GlobalEventHub>();
 builder.Services.AddSingleton<JobScanner>();
 builder.Services.AddSingleton<HookScanner>();
+
+builder.Services.AddAuthentication(SmartScheme)
+    .AddPolicyScheme(SmartScheme, "Cookie or Bearer", options =>
+    {
+        options.ForwardDefaultSelector = ctx =>
+            ctx.Request.Headers.ContainsKey("Authorization") ? ApiTokenScheme : CookieScheme;
+    })
+    .AddCookie(CookieScheme, options =>
+    {
+        options.Cookie.Name = "ci_session";
+        options.Cookie.HttpOnly = true;
+        options.Cookie.SameSite = SameSiteMode.Lax;
+        options.ExpireTimeSpan = TimeSpan.FromHours(config.Auth.SessionHours);
+        options.SlidingExpiration = true;
+        // This is an API, not a page app with server-side redirects: report 401/403 as status
+        // codes instead of redirecting to a (nonexistent) /login page.
+        options.Events.OnRedirectToLogin = ctx => { ctx.Response.StatusCode = StatusCodes.Status401Unauthorized; return Task.CompletedTask; };
+        options.Events.OnRedirectToAccessDenied = ctx => { ctx.Response.StatusCode = StatusCodes.Status403Forbidden; return Task.CompletedTask; };
+    })
+    .AddScheme<AuthenticationSchemeOptions, ApiTokenAuthenticationHandler>(ApiTokenScheme, _ => { });
+
+builder.Services.AddAuthorizationBuilder()
+    .AddPolicy("Viewer", p => p.RequireClaim("role", Role.Viewer, Role.Operator, Role.Admin))
+    .AddPolicy("Operator", p => p.RequireClaim("role", Role.Operator, Role.Admin))
+    .AddPolicy("Admin", p => p.RequireClaim("role", Role.Admin));
+
+builder.Services.AddSingleton<IClaimsTransformation, RoleClaimsTransformation>();
 builder.Services.AddSingleton(sp => new BuildRunner(
     paths,
     sp.GetRequiredService<BuildRepository>(),
@@ -87,8 +145,165 @@ app.Services.GetRequiredService<CiDatabase>().Migrate();
 app.Services.GetRequiredService<JobScanner>().ScanAndRegister();
 app.Services.GetRequiredService<HookScanner>().ScanAndRegister();
 
+// Initial admin bootstrap (spec §9): only ever applied while user_roles is empty, so this is a
+// one-time first-run action, not something that re-grants admin on every restart.
+{
+    var userRoles = app.Services.GetRequiredService<UserRoleRepository>();
+    if (userRoles.IsEmpty())
+    {
+        foreach (var username in config.Auth.InitialAdmins)
+        {
+            userRoles.Upsert(username, Role.Admin, "system:initialAdmins");
+        }
+    }
+}
+
 app.UseDefaultFiles();
 app.UseStaticFiles();
+app.UseAuthentication();
+app.UseAuthorization();
+
+app.MapPost("/api/login", async (LoginRequest? body, IAuthenticator auth, UserRoleRepository roles, RunnerConfig cfg, HttpContext ctx) =>
+{
+    if (string.IsNullOrEmpty(body?.Username) || string.IsNullOrEmpty(body.Password))
+    {
+        return Results.BadRequest(new { error = "username and password are required" });
+    }
+
+    AuthResult? result;
+    try
+    {
+        result = await auth.AuthenticateAsync(body.Username, body.Password, ctx.RequestAborted);
+    }
+    catch (Exception)
+    {
+        // LDAP server unreachable etc: fail closed, never fail open (spec §9 "既存セッション
+        // Cookie は有効期限まで有効" implies new logins are simply refused, not silently allowed).
+        return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+    }
+    if (result is null)
+    {
+        return Results.Unauthorized();
+    }
+
+    var roleRecord = roles.Find(result.Username);
+    var role = roleRecord?.Role ?? (cfg.Auth.DefaultRole == "deny" ? null : cfg.Auth.DefaultRole);
+    if (role is null)
+    {
+        return Results.Forbid();
+    }
+
+    var claims = new List<Claim> { new(ClaimTypes.Name, result.Username), new("role", role) };
+    if (result.DisplayName is not null) claims.Add(new Claim("displayName", result.DisplayName));
+    if (result.Mail is not null) claims.Add(new Claim("mail", result.Mail));
+
+    await ctx.SignInAsync(CookieScheme, new ClaimsPrincipal(new ClaimsIdentity(claims, CookieScheme)), new AuthenticationProperties
+    {
+        IsPersistent = true,
+        ExpiresUtc = DateTimeOffset.UtcNow.AddHours(cfg.Auth.SessionHours),
+    });
+
+    return Results.Ok(new { username = result.Username, displayName = result.DisplayName, mail = result.Mail, role });
+}).AllowAnonymous();
+
+app.MapPost("/api/logout", async (HttpContext ctx) =>
+{
+    await ctx.SignOutAsync(CookieScheme);
+    return Results.Ok();
+}).AllowAnonymous();
+
+app.MapGet("/api/me", (ClaimsPrincipal user) =>
+{
+    if (user.Identity is not { IsAuthenticated: true })
+    {
+        return Results.Ok(new { authenticated = false });
+    }
+    return Results.Ok(new
+    {
+        authenticated = true,
+        username = user.Identity.Name,
+        displayName = user.FindFirst("displayName")?.Value,
+        mail = user.FindFirst("mail")?.Value,
+        role = user.FindFirst("role")?.Value,
+        authMethod = user.FindFirst("authMethod")?.Value ?? "session",
+    });
+}).AllowAnonymous();
+
+app.MapGet("/api/users", (UserRoleRepository roles) => Results.Ok(roles.ListAll()))
+    .RequireAuthorization("Admin");
+
+app.MapPost("/api/users/{username}/role", (string username, RoleAssignRequest? body, UserRoleRepository roles, AuditLogRepository audit, ClaimsPrincipal actor) =>
+{
+    if (body?.Role is not (Role.Admin or Role.Operator or Role.Viewer))
+    {
+        return Results.BadRequest(new { error = "role must be admin, operator, or viewer" });
+    }
+    var before = roles.Find(username);
+    if (before?.Role == Role.Admin && body.Role != Role.Admin && roles.CountAdmins() <= 1)
+    {
+        return Results.BadRequest(new { error = "cannot demote the last admin" });
+    }
+    var actorName = actor.Identity!.Name!;
+    roles.Upsert(username, body.Role, actorName);
+    audit.Record(actorName, "role.assign", username,
+        before is null ? null : JsonSerializer.Serialize(new { role = before.Role }),
+        JsonSerializer.Serialize(new { role = body.Role }));
+    return Results.Ok();
+}).RequireAuthorization("Admin");
+
+app.MapDelete("/api/users/{username}/role", (string username, UserRoleRepository roles, AuditLogRepository audit, ClaimsPrincipal actor) =>
+{
+    var before = roles.Find(username);
+    if (before is null)
+    {
+        return Results.NotFound();
+    }
+    if (before.Role == Role.Admin && roles.CountAdmins() <= 1)
+    {
+        return Results.BadRequest(new { error = "cannot remove the last admin" });
+    }
+    var actorName = actor.Identity!.Name!;
+    roles.Delete(username);
+    audit.Record(actorName, "role.remove", username, JsonSerializer.Serialize(new { role = before.Role }), null);
+    return Results.Ok();
+}).RequireAuthorization("Admin");
+
+app.MapGet("/api/tokens", (ApiTokenRepository tokens) => Results.Ok(tokens.ListAll().Select(t => new
+{
+    t.Id,
+    t.Name,
+    t.Role,
+    t.CreatedAt,
+    t.CreatedBy,
+    t.LastUsedAt,
+    t.RevokedAt,
+}))).RequireAuthorization("Admin");
+
+app.MapPost("/api/tokens", (IssueTokenRequest? body, ApiTokenRepository tokens, AuditLogRepository audit, ClaimsPrincipal actor) =>
+{
+    if (string.IsNullOrWhiteSpace(body?.Name) || body.Role is not (Role.Admin or Role.Operator or Role.Viewer))
+    {
+        return Results.BadRequest(new { error = "name and a valid role are required" });
+    }
+    var actorName = actor.Identity!.Name!;
+    var rawToken = ApiTokenHasher.GenerateToken();
+    var id = tokens.Insert(body.Name, ApiTokenHasher.Hash(rawToken), body.Role, actorName);
+    audit.Record(actorName, "token.issue", body.Name, null, JsonSerializer.Serialize(new { role = body.Role }));
+    return Results.Ok(new { id, token = rawToken }); // shown once; only the hash is ever stored
+}).RequireAuthorization("Admin");
+
+app.MapDelete("/api/tokens/{id:long}", (long id, ApiTokenRepository tokens, AuditLogRepository audit, ClaimsPrincipal actor) =>
+{
+    if (!tokens.Revoke(id))
+    {
+        return Results.NotFound();
+    }
+    audit.Record(actor.Identity!.Name!, "token.revoke", id.ToString(), null, null);
+    return Results.Ok();
+}).RequireAuthorization("Admin");
+
+app.MapGet("/api/audit", (AuditLogRepository audit) => Results.Ok(audit.ListRecent(200)))
+    .RequireAuthorization("Admin");
 
 app.MapGet("/api/jobs", (JobRepository jobRepo, BuildRepository buildRepo) =>
 {
@@ -102,7 +317,7 @@ app.MapGet("/api/jobs", (JobRepository jobRepo, BuildRepository buildRepo) =>
         RecentBuilds = buildRepo.ListByJob(j.Id, 10).Select(b => new { b.Number, b.Status }),
     });
     return Results.Ok(jobs);
-});
+}).RequireAuthorization("Viewer");
 
 app.MapGet("/api/queue", (BuildRepository buildRepo, JobRepository jobRepo) =>
 {
@@ -122,7 +337,7 @@ app.MapGet("/api/queue", (BuildRepository buildRepo, JobRepository jobRepo) =>
         };
     });
     return Results.Ok(result);
-});
+}).RequireAuthorization("Viewer");
 
 app.MapGet("/api/status", (SettingsRepository settings, BuildRepository buildRepo, RunnerConfig cfg) =>
 {
@@ -133,7 +348,7 @@ app.MapGet("/api/status", (SettingsRepository settings, BuildRepository buildRep
         QueueLength = buildRepo.CountByStatus(BuildStatus.Queued) + buildRepo.CountByStatus(BuildStatus.Waiting),
         Port = cfg.Port,
     });
-});
+}).RequireAuthorization("Viewer");
 
 app.MapGet("/api/jobs/{name}/builds", (string name, JobRepository jobRepo, BuildRepository buildRepo) =>
 {
@@ -144,7 +359,7 @@ app.MapGet("/api/jobs/{name}/builds", (string name, JobRepository jobRepo, Build
     }
     var builds = buildRepo.ListByJob(job.Id).Select(MapBuildSummary);
     return Results.Ok(builds);
-});
+}).RequireAuthorization("Viewer");
 
 app.MapPost("/api/jobs/{name}/trigger", (string name, TriggerRequest? body, JobTriggerService triggerService) =>
 {
@@ -158,7 +373,7 @@ app.MapPost("/api/jobs/{name}/trigger", (string name, TriggerRequest? body, JobT
         return Results.BadRequest(new { error = result.Reason });
     }
     return Results.Ok(MapBuildSummary(result.Build));
-});
+}).RequireAuthorization("Operator");
 
 app.MapPost("/api/internal/start-job/{name}", (string name, StartJobRequest? body, JobTriggerService triggerService, HookRunRepository hookRunRepo) =>
 {
@@ -180,7 +395,7 @@ app.MapPost("/api/internal/start-job/{name}", (string name, StartJobRequest? bod
         Url = result.Build is null ? null : $"{serverUrl}/#/builds/{result.Build.Id}",
         Reason = result.Reason,
     });
-});
+}).AllowAnonymous();
 
 app.MapPost("/api/webhook/{name}", async (string name, HttpRequest request, WebhookReceiver receiver) =>
 {
@@ -196,7 +411,7 @@ app.MapPost("/api/webhook/{name}", async (string name, HttpRequest request, Webh
         WebhookReceiveResult.Unauthorized => Results.Unauthorized(),
         _ => Results.Ok(),
     };
-});
+}).AllowAnonymous();
 
 app.MapGet("/api/builds/{id:long}", (long id, BuildRepository buildRepo, JobRepository jobRepo) =>
 {
@@ -231,19 +446,19 @@ app.MapGet("/api/builds/{id:long}", (long id, BuildRepository buildRepo, JobRepo
         build.FinishedAt,
         Steps = steps,
     });
-});
+}).RequireAuthorization("Viewer");
 
 app.MapGet("/api/builds/{id:long}/tests", (long id, TestResultRepository testRepo) =>
 {
     var tests = testRepo.ListByBuild(id).Select(t => new { t.Suite, t.Name, t.Status, t.DurationMs, t.Message });
     return Results.Ok(tests);
-});
+}).RequireAuthorization("Viewer");
 
 app.MapGet("/api/builds/{id:long}/artifacts", (long id, ArtifactRepository artifactRepo) =>
 {
     var artifacts = artifactRepo.ListByBuild(id).Select(a => new { a.Id, a.Path, a.Size });
     return Results.Ok(artifacts);
-});
+}).RequireAuthorization("Viewer");
 
 app.MapGet("/api/builds/{id:long}/artifacts/{artifactId:long}/download", (long id, long artifactId, ArtifactRepository artifactRepo, RunnerPaths paths) =>
 {
@@ -260,7 +475,7 @@ app.MapGet("/api/builds/{id:long}/artifacts/{artifactId:long}/download", (long i
         return Results.NotFound();
     }
     return Results.File(fullPath, "application/octet-stream", Path.GetFileName(artifact.Path));
-});
+}).RequireAuthorization("Viewer");
 
 app.MapGet("/api/builds/{id:long}/log/stream", async (long id, HttpContext ctx, BuildRepository buildRepo, JobRepository jobRepo, LiveLogHub logHub, RunnerPaths paths) =>
 {
@@ -301,7 +516,7 @@ app.MapGet("/api/builds/{id:long}/log/stream", async (long id, HttpContext ctx, 
     }
 
     return Results.Empty;
-});
+}).RequireAuthorization("Viewer");
 
 app.MapGet("/api/events", async (HttpContext ctx, GlobalEventHub eventHub) =>
 {
@@ -325,7 +540,7 @@ app.MapGet("/api/events", async (HttpContext ctx, GlobalEventHub eventHub) =>
         eventHub.Unsubscribe(reader);
     }
     return Results.Empty;
-});
+}).RequireAuthorization("Viewer");
 
 app.Run();
 
@@ -357,4 +572,21 @@ sealed class StartJobRequest
     public Dictionary<string, string>? Parameters { get; set; }
     public string? DedupKey { get; set; }
     public long? HookRunId { get; set; }
+}
+
+sealed class LoginRequest
+{
+    public string? Username { get; set; }
+    public string? Password { get; set; }
+}
+
+sealed class RoleAssignRequest
+{
+    public string? Role { get; set; }
+}
+
+sealed class IssueTokenRequest
+{
+    public string? Name { get; set; }
+    public string? Role { get; set; }
 }
