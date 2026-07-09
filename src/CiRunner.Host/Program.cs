@@ -19,6 +19,8 @@ builder.Services.AddSingleton(paths);
 builder.Services.AddSingleton(new CiDatabase(paths.DbPath));
 builder.Services.AddSingleton<JobRepository>();
 builder.Services.AddSingleton<BuildRepository>();
+builder.Services.AddSingleton<TestResultRepository>();
+builder.Services.AddSingleton<ArtifactRepository>();
 builder.Services.AddSingleton<SettingsRepository>();
 builder.Services.AddSingleton<HookRepository>();
 builder.Services.AddSingleton<HookRunRepository>();
@@ -29,11 +31,15 @@ builder.Services.AddSingleton<HookScanner>();
 builder.Services.AddSingleton(sp => new BuildRunner(
     paths,
     sp.GetRequiredService<BuildRepository>(),
+    sp.GetRequiredService<TestResultRepository>(),
+    sp.GetRequiredService<ArtifactRepository>(),
+    sp.GetRequiredService<SettingsRepository>(),
     sp.GetRequiredService<LiveLogHub>(),
     sp.GetRequiredService<GlobalEventHub>(),
     Path.Combine(AppContext.BaseDirectory, "psmodule", "bootstrap.ps1"),
     serverUrl,
     config.Git.ExePath));
+builder.Services.AddSingleton<RetentionService>();
 builder.Services.AddSingleton(sp =>
 {
     var executorLimit = sp.GetRequiredService<SettingsRepository>().GetInt("executors", 2);
@@ -42,7 +48,8 @@ builder.Services.AddSingleton(sp =>
         sp.GetRequiredService<JobRepository>(),
         sp.GetRequiredService<BuildRunner>(),
         sp.GetRequiredService<GlobalEventHub>(),
-        executorLimit);
+        executorLimit,
+        sp.GetRequiredService<RetentionService>());
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<BuildDispatcher>());
 builder.Services.AddSingleton<JobTriggerService>();
@@ -224,6 +231,35 @@ app.MapGet("/api/builds/{id:long}", (long id, BuildRepository buildRepo, JobRepo
         build.FinishedAt,
         Steps = steps,
     });
+});
+
+app.MapGet("/api/builds/{id:long}/tests", (long id, TestResultRepository testRepo) =>
+{
+    var tests = testRepo.ListByBuild(id).Select(t => new { t.Suite, t.Name, t.Status, t.DurationMs, t.Message });
+    return Results.Ok(tests);
+});
+
+app.MapGet("/api/builds/{id:long}/artifacts", (long id, ArtifactRepository artifactRepo) =>
+{
+    var artifacts = artifactRepo.ListByBuild(id).Select(a => new { a.Id, a.Path, a.Size });
+    return Results.Ok(artifacts);
+});
+
+app.MapGet("/api/builds/{id:long}/artifacts/{artifactId:long}/download", (long id, long artifactId, ArtifactRepository artifactRepo, RunnerPaths paths) =>
+{
+    // artifactId is a DB-assigned integer, not a client-supplied path, so there is nothing to
+    // sanitize: the on-disk path always comes from our own artifact record, never from the request.
+    var artifact = artifactRepo.ListByBuild(id).FirstOrDefault(a => a.Id == artifactId);
+    if (artifact is null)
+    {
+        return Results.NotFound();
+    }
+    var fullPath = Path.Combine(paths.ArtifactsDir, id.ToString(), artifact.Path);
+    if (!File.Exists(fullPath))
+    {
+        return Results.NotFound();
+    }
+    return Results.File(fullPath, "application/octet-stream", Path.GetFileName(artifact.Path));
 });
 
 app.MapGet("/api/builds/{id:long}/log/stream", async (long id, HttpContext ctx, BuildRepository buildRepo, JobRepository jobRepo, LiveLogHub logHub, RunnerPaths paths) =>

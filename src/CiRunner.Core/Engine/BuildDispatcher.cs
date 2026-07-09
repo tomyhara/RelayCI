@@ -14,6 +14,7 @@ public sealed class BuildDispatcher : BackgroundService
     private readonly JobRepository _jobRepo;
     private readonly BuildRunner _buildRunner;
     private readonly GlobalEventHub _eventHub;
+    private readonly RetentionService? _retentionService;
     private readonly int _executorLimit;
 
     private readonly object _stateLock = new();
@@ -21,12 +22,13 @@ public sealed class BuildDispatcher : BackgroundService
     private int _activeExecutors;
     private readonly SemaphoreSlim _wake = new(1);
 
-    public BuildDispatcher(BuildRepository buildRepo, JobRepository jobRepo, BuildRunner buildRunner, GlobalEventHub eventHub, int executorLimit = 2)
+    public BuildDispatcher(BuildRepository buildRepo, JobRepository jobRepo, BuildRunner buildRunner, GlobalEventHub eventHub, int executorLimit = 2, RetentionService? retentionService = null)
     {
         _buildRepo = buildRepo;
         _jobRepo = jobRepo;
         _buildRunner = buildRunner;
         _eventHub = eventHub;
+        _retentionService = retentionService;
         _executorLimit = executorLimit;
     }
 
@@ -93,6 +95,7 @@ public sealed class BuildDispatcher : BackgroundService
         try
         {
             await _buildRunner.RunAsync(job, build, ct);
+            _retentionService?.Enforce(job);
         }
         finally
         {

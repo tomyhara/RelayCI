@@ -158,4 +158,96 @@ public class BuildRunnerIntegrationTests
         Assert.Equal("always", steps[1].Post);
         Assert.Equal(StepStatus.Success, steps[1].Status);
     }
+
+    [Fact]
+    public async Task RunAsync_RegisterJUnit_PersistsTestResults_ENG060()
+    {
+        using var fx = new EngineFixture();
+        var job = fx.CreateJob("junit-job", """
+            Stage "Test" {
+                New-Item -ItemType Directory -Path results -Force | Out-Null
+                @'
+            <testsuites>
+              <testsuite name="unit">
+                <testcase name="a" time="0.01"/>
+                <testcase name="b" time="0.02"><failure message="nope">trace</failure></testcase>
+              </testsuite>
+            </testsuites>
+            '@ | Set-Content results\out.xml
+                Register-JUnit "results\*.xml"
+            }
+            """);
+        var build = fx.Builds.CreateQueued(job.Id, BuildTrigger.Manual, "{}", null);
+
+        await fx.Runner.RunAsync(job, build, CancellationToken.None);
+
+        // A genuinely failing test flips an otherwise exit-0 build to Failed under strict mode (default).
+        Assert.Equal(BuildStatus.Failed, fx.Builds.FindById(build.Id)!.Status);
+        var results = fx.TestResults.ListByBuild(build.Id);
+        Assert.Equal(2, results.Count);
+        Assert.Contains(results, r => r.Name == "a" && r.Status == TestCaseStatus.Passed);
+        Assert.Contains(results, r => r.Name == "b" && r.Status == TestCaseStatus.Failed);
+    }
+
+    [Fact]
+    public async Task RunAsync_ExitCodeOnlyMode_IgnoresTestFailures_ENG062()
+    {
+        using var fx = new EngineFixture();
+        fx.Settings.Set("testResultMode", "exit-code-only");
+        var job = fx.CreateJob("junit-job2", """
+            Stage "Test" {
+                New-Item -ItemType Directory -Path results -Force | Out-Null
+                '<testsuite name="s"><testcase name="fails"><failure>x</failure></testcase></testsuite>' | Set-Content results\out.xml
+                Register-JUnit "results\*.xml"
+            }
+            """);
+        var build = fx.Builds.CreateQueued(job.Id, BuildTrigger.Manual, "{}", null);
+
+        await fx.Runner.RunAsync(job, build, CancellationToken.None);
+
+        Assert.Equal(BuildStatus.Success, fx.Builds.FindById(build.Id)!.Status);
+    }
+
+    [Fact]
+    public async Task RunAsync_RegisterArtifact_PersistsArtifactRecords()
+    {
+        using var fx = new EngineFixture();
+        var job = fx.CreateJob("artifact-job", """
+            Stage "Build" {
+                New-Item -ItemType Directory -Path out -Force | Out-Null
+                "hex data" | Set-Content out\app.hex
+                Register-Artifact "out\*.hex"
+            }
+            """);
+        var build = fx.Builds.CreateQueued(job.Id, BuildTrigger.Manual, "{}", null);
+
+        await fx.Runner.RunAsync(job, build, CancellationToken.None);
+
+        Assert.Equal(BuildStatus.Success, fx.Builds.FindById(build.Id)!.Status);
+        var artifacts = fx.Artifacts.ListByBuild(build.Id);
+        var single = Assert.Single(artifacts);
+        Assert.Contains("app.hex", single.Path);
+        Assert.True(single.Size > 0);
+    }
+
+    [Fact]
+    public async Task RunAsync_MalformedJUnitXml_WarnsWithoutFailingBuild_ENG061()
+    {
+        using var fx = new EngineFixture();
+        var job = fx.CreateJob("bad-junit-job", """
+            Stage "Test" {
+                New-Item -ItemType Directory -Path results -Force | Out-Null
+                "<testsuite><not-closed" | Set-Content results\out.xml
+                Register-JUnit "results\*.xml"
+            }
+            """);
+        var build = fx.Builds.CreateQueued(job.Id, BuildTrigger.Manual, "{}", null);
+
+        await fx.Runner.RunAsync(job, build, CancellationToken.None);
+
+        Assert.Equal(BuildStatus.Success, fx.Builds.FindById(build.Id)!.Status);
+        Assert.Empty(fx.TestResults.ListByBuild(build.Id));
+        var log = await File.ReadAllTextAsync(fx.Paths.BuildLogPath("bad-junit-job", build.Number));
+        Assert.Contains("WARNING", log);
+    }
 }

@@ -16,6 +16,9 @@ public sealed class BuildRunner
 {
     private readonly RunnerPaths _paths;
     private readonly BuildRepository _buildRepo;
+    private readonly TestResultRepository _testResultRepo;
+    private readonly ArtifactRepository _artifactRepo;
+    private readonly SettingsRepository _settings;
     private readonly LiveLogHub _logHub;
     private readonly GlobalEventHub _eventHub;
     private readonly string _bootstrapScriptPath;
@@ -26,6 +29,9 @@ public sealed class BuildRunner
     public BuildRunner(
         RunnerPaths paths,
         BuildRepository buildRepo,
+        TestResultRepository testResultRepo,
+        ArtifactRepository artifactRepo,
+        SettingsRepository settings,
         LiveLogHub logHub,
         GlobalEventHub eventHub,
         string bootstrapScriptPath,
@@ -34,6 +40,9 @@ public sealed class BuildRunner
     {
         _paths = paths;
         _buildRepo = buildRepo;
+        _testResultRepo = testResultRepo;
+        _artifactRepo = artifactRepo;
+        _settings = settings;
         _logHub = logHub;
         _eventHub = eventHub;
         _bootstrapScriptPath = bootstrapScriptPath;
@@ -160,6 +169,18 @@ public sealed class BuildRunner
         else
         {
             finalStatus = process.ExitCode == 0 ? BuildStatus.Success : BuildStatus.Failed;
+
+            // Strict mode (spec §5 F4, default): a build that exits 0 is still Failed if any
+            // ingested JUnit test case failed or errored. exit-code-only trusts the process exit
+            // code alone. Only applies when the build would otherwise be Success - already-failed
+            // builds stay failed regardless.
+            if (finalStatus == BuildStatus.Success
+                && _settings.GetString("testResultMode", "strict") == "strict"
+                && _testResultRepo.HasFailures(build.Id))
+            {
+                finalStatus = BuildStatus.Failed;
+                WriteLogLine(build.Id, "build marked Failed: one or more JUnit test cases failed (strict mode)");
+            }
         }
 
         FinishBuild(build.Id, finalStatus);
@@ -370,9 +391,70 @@ public sealed class BuildRunner
                 WriteLogLine(buildId, $"ERROR: {message}");
                 break;
             }
-            // "start", "junit", "artifact" and any future event types are either informational only for
-            // M1 or handled by later milestones (F4 test-result / artifact ingestion); unknown ev values
-            // are ignored per DSL spec §4.3 forward-compatibility rule.
+            case "junit":
+            {
+                HandleJUnitEvent(buildId, evt);
+                break;
+            }
+            case "artifact":
+            {
+                HandleArtifactEvent(buildId, evt);
+                break;
+            }
+            // "start" and any future event types are ignored per DSL spec §4.3 forward-compatibility rule.
+        }
+    }
+
+    private void HandleJUnitEvent(long buildId, ControlFileEvent evt)
+    {
+        var files = evt.GetArray("files");
+        if (files is null)
+        {
+            return;
+        }
+
+        var resultDir = Path.Combine(_paths.ResultsDir, buildId.ToString());
+        foreach (var fileEl in files.Value.EnumerateArray())
+        {
+            var relPath = fileEl.GetString();
+            if (string.IsNullOrEmpty(relPath))
+            {
+                continue;
+            }
+
+            var fullPath = Path.Combine(resultDir, relPath);
+            if (JUnitXmlParser.TryParse(fullPath, out var results, out var error))
+            {
+                _testResultRepo.InsertMany(buildId, results);
+            }
+            else
+            {
+                WriteLogLine(buildId, $"WARNING: could not parse JUnit XML '{relPath}': {error}");
+            }
+        }
+    }
+
+    private void HandleArtifactEvent(long buildId, ControlFileEvent evt)
+    {
+        var files = evt.GetArray("files");
+        if (files is null)
+        {
+            return;
+        }
+
+        foreach (var fileEl in files.Value.EnumerateArray())
+        {
+            if (fileEl.ValueKind != JsonValueKind.Object)
+            {
+                continue;
+            }
+            var path = fileEl.TryGetProperty("path", out var p) ? p.GetString() : null;
+            if (string.IsNullOrEmpty(path))
+            {
+                continue;
+            }
+            long? size = fileEl.TryGetProperty("size", out var s) && s.ValueKind == JsonValueKind.Number ? s.GetInt64() : null;
+            _artifactRepo.Insert(buildId, path, size);
         }
     }
 

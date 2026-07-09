@@ -15,11 +15,15 @@ public sealed class EngineFixture : IDisposable
     public CiDatabase Db { get; }
     public JobRepository Jobs { get; }
     public BuildRepository Builds { get; }
+    public TestResultRepository TestResults { get; }
+    public ArtifactRepository Artifacts { get; }
+    public SettingsRepository Settings { get; }
     public HookRepository Hooks { get; }
     public HookRunRepository HookRuns { get; }
     public LiveLogHub LogHub { get; } = new();
     public GlobalEventHub EventHub { get; } = new();
     public BuildRunner Runner { get; }
+    public RetentionService Retention { get; }
     public BuildDispatcher Dispatcher { get; }
     public JobTriggerService TriggerService { get; }
     public HandlerRunner HandlerRunner { get; }
@@ -37,11 +41,15 @@ public sealed class EngineFixture : IDisposable
         Db.Migrate();
         Jobs = new JobRepository(Db);
         Builds = new BuildRepository(Db);
+        TestResults = new TestResultRepository(Db);
+        Artifacts = new ArtifactRepository(Db);
+        Settings = new SettingsRepository(Db);
         Hooks = new HookRepository(Db);
         HookRuns = new HookRunRepository(Db);
 
-        Runner = new BuildRunner(Paths, Builds, LogHub, EventHub, RepoPaths.BootstrapScript, "http://localhost:0");
-        Dispatcher = new BuildDispatcher(Builds, Jobs, Runner, EventHub, executorLimit);
+        Runner = new BuildRunner(Paths, Builds, TestResults, Artifacts, Settings, LogHub, EventHub, RepoPaths.BootstrapScript, "http://localhost:0");
+        Retention = new RetentionService(Paths, Builds, Settings);
+        Dispatcher = new BuildDispatcher(Builds, Jobs, Runner, EventHub, executorLimit, Retention);
         TriggerService = new JobTriggerService(Jobs, Builds, Dispatcher);
         HandlerRunner = new HandlerRunner(Paths, HookRuns, RepoPaths.BootstrapScript, "http://localhost:0");
         Webhook = new WebhookReceiver(Paths, Hooks, HookRuns, HandlerRunner, handlerConcurrency);

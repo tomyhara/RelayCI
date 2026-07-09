@@ -20,6 +20,15 @@ public sealed class SettingsRepository
         return result is string s && int.TryParse(s, out var v) ? v : defaultValue;
     }
 
+    public string GetString(string key, string defaultValue)
+    {
+        using var conn = _db.OpenConnection();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT value FROM settings WHERE key = $key";
+        cmd.Parameters.AddWithValue("$key", key);
+        return cmd.ExecuteScalar() is string s ? s : defaultValue;
+    }
+
     public void Set(string key, string value, string? updatedBy = null)
     {
         using var conn = _db.OpenConnection();

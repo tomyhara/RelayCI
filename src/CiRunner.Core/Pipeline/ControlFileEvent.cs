@@ -14,6 +14,9 @@ public sealed class ControlFileEvent
     public int? GetInt(string prop) =>
         Raw.TryGetProperty(prop, out var v) && v.ValueKind == JsonValueKind.Number ? v.GetInt32() : null;
 
+    public JsonElement? GetArray(string prop) =>
+        Raw.TryGetProperty(prop, out var v) && v.ValueKind == JsonValueKind.Array ? v : null;
+
     public static ControlFileEvent? TryParse(string line)
     {
         if (string.IsNullOrWhiteSpace(line))

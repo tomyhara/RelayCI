@@ -143,6 +143,13 @@ h1{font-size:22px;margin:0 0 3px}
 .cursor{display:inline-block;width:8px;height:14px;background:var(--st-running);animation:rc-blink 1s step-end infinite;vertical-align:middle}
 
 .hint{padding:11px 13px;background:var(--surface-2);border:1px solid var(--border);border-radius:8px;font-size:11.5px;color:var(--text-2)}
+
+.tabbar{display:flex;gap:2px;margin-bottom:14px;border-bottom:1px solid var(--border)}
+.tab{padding:9px 15px;font-size:13px;font-weight:600;cursor:pointer;color:var(--text-2);border-bottom:2px solid transparent;margin-bottom:-1px;display:flex;align-items:center;gap:7px}
+.tab:hover{color:var(--text)}
+.tab.active{color:var(--text);border-bottom-color:var(--accent)}
+.tab .count{font-family:ui-monospace,'Cascadia Code',Consolas,'SF Mono',monospace;font-size:10px;padding:1px 6px;border-radius:9px;background:var(--surface-3);color:var(--text-2)}
+.tab .count.fail{background:var(--st-failed-soft);color:var(--st-failed)}
 </style>
 </head>
 <body>
@@ -419,21 +426,33 @@ route('/builds/:id', renderBuildDetail);
 let currentBuildId = null;
 let expandedSteps = {};
 let logSource = null;
+let activeBuildTab = 'steps';
 
 async function renderBuildDetail(params){
   currentBuildId = Number(params.id);
   expandedSteps = {};
+  activeBuildTab = 'steps';
   await refreshBuildDetail(true);
+}
+
+function switchBuildTab(id){
+  activeBuildTab = id;
+  refreshBuildDetail(false);
 }
 
 async function refreshBuildDetail(scaffold){
   if (currentPath() !== '/builds/'+currentBuildId) return;
   const main = document.getElementById('main');
-  let build;
-  try { build = await api(`/api/builds/${currentBuildId}`); }
+  let build, tests, artifacts;
+  try {
+    [build, tests, artifacts] = await Promise.all([
+      api(`/api/builds/${currentBuildId}`),
+      api(`/api/builds/${currentBuildId}/tests`),
+      api(`/api/builds/${currentBuildId}/artifacts`),
+    ]);
+  }
   catch (e) { main.innerHTML = `<div class="page"><div class="emptystate">Build not found.</div></div>`; return; }
 
-  const m = meta(build.status);
   const total = build.steps.reduce((a,s)=>a + Math.max(1, (new Date(s.finishedAt||Date.now()) - new Date(s.startedAt||Date.now()))/1000), 0) || 1;
   const gantt = build.steps.map(s => {
     const secs = Math.max(1, (new Date(s.finishedAt||Date.now()) - new Date(s.startedAt||Date.now()))/1000);
@@ -446,8 +465,8 @@ async function refreshBuildDetail(scaffold){
     <div class="page fade" style="max-width:1180px">
       <div class="crumb"><span class="link" onclick="navigate('/jobs')">jobs</span> / <span class="link" onclick="navigate('/jobs/${encodeURIComponent(build.jobName)}')">${esc(build.jobName)}</span> / <span>#${build.number}</span></div>
       <div class="buildhead" id="build-header"></div>
-      <div id="build-steps"></div>
-      <div class="hint" style="margin-top:4px">Test results and artifact downloads arrive with a later milestone (F4 in the spec).</div>
+      <div class="tabbar" id="build-tabbar"></div>
+      <div id="build-tab-content"></div>
     </div>`;
   }
 
@@ -472,10 +491,32 @@ async function refreshBuildDetail(scaffold){
     </div>
     <div class="gantt">${gantt}</div>`;
 
+  const testFailCount = tests.filter(t => t.status === 'failed' || t.status === 'error').length;
+  const tabs = [
+    { id: 'steps', label: 'Steps', count: build.steps.length, fail: false },
+    { id: 'tests', label: 'Tests', count: testFailCount ? testFailCount + ' failed' : tests.length, fail: testFailCount > 0 },
+    { id: 'artifacts', label: 'Artifacts', count: artifacts.length, fail: false },
+  ];
+  document.getElementById('build-tabbar').innerHTML = tabs.map(t => `
+    <div class="tab ${activeBuildTab===t.id?'active':''}" onclick="switchBuildTab('${t.id}')">
+      ${t.label}<span class="count ${t.fail?'fail':''}">${t.count}</span>
+    </div>`).join('');
+
+  const contentEl = document.getElementById('build-tab-content');
+  if (activeBuildTab === 'tests') {
+    renderTestsTab(contentEl, tests);
+  } else if (activeBuildTab === 'artifacts') {
+    renderArtifactsTab(contentEl, artifacts, build.id);
+  } else {
+    renderStepsTab(contentEl, build);
+  }
+}
+
+function renderStepsTab(el, build){
   // A running step always auto-expands; mark that before rendering so its log container exists.
   build.steps.forEach(s => { if (s.status === 'running') expandedSteps[s.seq] = true; });
 
-  document.getElementById('build-steps').innerHTML = build.steps.length === 0
+  el.innerHTML = build.steps.length === 0
     ? `<div class="emptystate">${build.status==='queued' ? 'Waiting to start…' : 'No steps recorded.'}</div>`
     : build.steps.map(s => renderStep(s, build.status)).join('');
 
@@ -486,6 +527,71 @@ async function refreshBuildDetail(scaffold){
   build.steps.forEach(s => {
     if (expandedSteps[s.seq]) loadStepLog(build, s);
   });
+}
+
+function renderTestsTab(el, tests){
+  if (tests.length === 0) {
+    el.innerHTML = `<div class="emptystate">No test results for this build.</div>`;
+    return;
+  }
+
+  const passed = tests.filter(t => t.status === 'passed').length;
+  const failed = tests.filter(t => t.status === 'failed' || t.status === 'error').length;
+  const skipped = tests.filter(t => t.status === 'skipped').length;
+  const summary = [
+    { label: 'Passed', value: passed, color: 'var(--st-success)' },
+    { label: 'Failed', value: failed, color: 'var(--st-failed)' },
+    { label: 'Skipped', value: skipped, color: 'var(--st-queued)' },
+    { label: 'Total', value: tests.length, color: 'var(--accent)' },
+  ];
+
+  el.innerHTML = `
+    <div class="statgrid">
+      ${summary.map(s => `
+        <div class="statcard" style="border-left:3px solid ${s.color}">
+          <div class="val display" style="color:${s.color}">${s.value}</div>
+          <div class="lbl">${s.label}</div>
+        </div>`).join('')}
+    </div>
+    <div class="card">
+      <div class="thead" style="grid-template-columns:22px 1fr 150px 80px"><div></div><div>Test case</div><div>Suite</div><div style="text-align:right">Time</div></div>
+      ${tests.map(t => {
+        const isFail = t.status === 'failed' || t.status === 'error';
+        const mark = t.status === 'passed' ? '&#10003;' : (t.status === 'skipped' ? '&#8211;' : '&#10007;');
+        const color = isFail ? 'var(--st-failed)' : (t.status === 'skipped' ? 'var(--st-queued)' : 'var(--st-success)');
+        const soft = isFail ? 'var(--st-failed-soft)' : (t.status === 'skipped' ? 'var(--st-queued-soft)' : 'var(--st-success-soft)');
+        return `
+        <div style="border-bottom:1px solid var(--border)">
+          <div style="display:grid;grid-template-columns:22px 1fr 150px 80px;gap:12px;padding:9px 16px;align-items:center">
+            <span style="width:16px;height:16px;border-radius:4px;background:${soft};color:${color};display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700">${mark}</span>
+            <span class="mono" style="font-size:12px;${isFail?'color:var(--st-failed)':''}">${esc(t.name)}</span>
+            <span class="sub" style="font-size:11.5px">${esc(t.suite || '')}</span>
+            <span class="mono" style="font-size:11.5px;text-align:right">${t.durationMs != null ? t.durationMs+' ms' : '–'}</span>
+          </div>
+          ${t.message ? `<div style="margin:0 16px 10px 50px;padding:9px 12px;background:var(--st-failed-soft);border-radius:7px;font-family:ui-monospace,monospace;font-size:11px;color:var(--st-failed);white-space:pre-wrap">${esc(t.message)}</div>` : ''}
+        </div>`;
+      }).join('')}
+    </div>`;
+}
+
+function fmtBytes(n){
+  if (n == null) return '–';
+  if (n < 1024) return n + ' B';
+  if (n < 1024*1024) return (n/1024).toFixed(1) + ' KB';
+  return (n/1024/1024).toFixed(2) + ' MB';
+}
+
+function renderArtifactsTab(el, artifacts, buildId){
+  if (artifacts.length === 0) {
+    el.innerHTML = `<div class="emptystate">No artifacts for this build.</div>`;
+    return;
+  }
+  el.innerHTML = `<div class="card">` + artifacts.map(a => `
+    <div style="display:flex;align-items:center;gap:12px;padding:12px 16px;border-bottom:1px solid var(--border)">
+      <span class="mono" style="font-size:12.5px;flex:1">${esc(a.path)}</span>
+      <span class="mono sub" style="font-size:11.5px">${fmtBytes(a.size)}</span>
+      <a href="/api/builds/${buildId}/artifacts/${a.id}/download" class="btn" style="padding:5px 12px;font-size:12px;text-decoration:none">Download</a>
+    </div>`).join('') + `</div>`;
 }
 
 function renderStep(s, buildStatus){

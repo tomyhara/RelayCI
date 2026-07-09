@@ -13,6 +13,29 @@ public sealed class BuildRepository
         _db = db;
     }
 
+    /// <summary>Deletes a build and its dependent rows (spec §8 retention). Files are the caller's responsibility.</summary>
+    public void DeleteBuild(long buildId)
+    {
+        using var conn = _db.OpenConnection();
+        using var tx = conn.BeginTransaction();
+        foreach (var table in new[] { "test_results", "artifacts", "build_steps" })
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText = $"DELETE FROM {table} WHERE build_id = $id";
+            cmd.Parameters.AddWithValue("$id", buildId);
+            cmd.ExecuteNonQuery();
+        }
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.Transaction = tx;
+            cmd.CommandText = "DELETE FROM builds WHERE id = $id";
+            cmd.Parameters.AddWithValue("$id", buildId);
+            cmd.ExecuteNonQuery();
+        }
+        tx.Commit();
+    }
+
     /// <summary>Allocates the next build number for the job and inserts a Queued build. Serialized to avoid duplicate numbers.</summary>
     public BuildRecord CreateQueued(long jobId, string trigger, string parametersJson, string? dedupKey, string? commitSha = null, string? branch = null)
     {
