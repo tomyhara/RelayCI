@@ -9,6 +9,7 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.10" />
     <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="8.0.1" />
+    <PackageReference Include="Cronos" Version="0.9.0" />
   </ItemGroup>
 
 </Project>

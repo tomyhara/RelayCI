@@ -20,6 +20,7 @@ public sealed class BuildRunner
     private readonly GlobalEventHub _eventHub;
     private readonly string _bootstrapScriptPath;
     private readonly string _serverUrl;
+    private readonly string _gitExePath;
     private static readonly TimeSpan DefaultTimeout = TimeSpan.FromMinutes(60);
 
     public BuildRunner(
@@ -28,7 +29,8 @@ public sealed class BuildRunner
         LiveLogHub logHub,
         GlobalEventHub eventHub,
         string bootstrapScriptPath,
-        string serverUrl)
+        string serverUrl,
+        string gitExePath = "git")
     {
         _paths = paths;
         _buildRepo = buildRepo;
@@ -36,6 +38,7 @@ public sealed class BuildRunner
         _eventHub = eventHub;
         _bootstrapScriptPath = bootstrapScriptPath;
         _serverUrl = serverUrl;
+        _gitExePath = gitExePath;
     }
 
     public async Task RunAsync(JobRecord job, BuildRecord build, CancellationToken ct)
@@ -43,7 +46,6 @@ public sealed class BuildRunner
         var logPath = _paths.BuildLogPath(job.Name, build.Number);
         _logHub.OpenForWriting(build.Id, logPath);
 
-        var pipelinePath = _paths.JobPipelinePath(job.Name);
         var workspaceDir = string.IsNullOrEmpty(job.WorkspacePath) ? _paths.JobWorkspaceDir(job.Name) : job.WorkspacePath;
         Directory.CreateDirectory(workspaceDir);
 
@@ -54,6 +56,22 @@ public sealed class BuildRunner
         var artifactDir = Path.Combine(_paths.ArtifactsDir, build.Id.ToString());
         Directory.CreateDirectory(resultDir);
         Directory.CreateDirectory(artifactDir);
+
+        // Repository ジョブ (spec §5 F3): clone/fetch + checkout <SHA|branch|origin/HEAD> + clean -fdx.
+        // Repo-less jobs skip this entirely and just use the (possibly fixed) workspace as-is.
+        if (!string.IsNullOrEmpty(job.RepoUrl))
+        {
+            var checkedOut = await CheckoutRepoAsync(job, build, workspaceDir, ct);
+            if (!checkedOut)
+            {
+                FinishBuild(build.Id, BuildStatus.Failed);
+                return;
+            }
+        }
+
+        var pipelinePath = job.PipelineSource == "repo"
+            ? Path.Combine(workspaceDir, (job.PipelinePath ?? ".ci/pipeline.cipipe").Replace('/', Path.DirectorySeparatorChar))
+            : _paths.JobPipelinePath(job.Name);
 
         if (!File.Exists(pipelinePath))
         {
@@ -145,6 +163,118 @@ public sealed class BuildRunner
         }
 
         FinishBuild(build.Id, finalStatus);
+    }
+
+    /// <summary>
+    /// Clone (first use) or fetch + checkout &lt;SHA|branch|origin/HEAD&gt; + clean -fdx (spec §5 F3).
+    /// Mutates and persists build.CommitSha to the SHA actually checked out, so env var injection
+    /// and the UI reflect what really ran even when the caller only knew a branch name.
+    /// </summary>
+    private async Task<bool> CheckoutRepoAsync(JobRecord job, BuildRecord build, string workspaceDir, CancellationToken ct)
+    {
+        try
+        {
+            if (!Directory.Exists(Path.Combine(workspaceDir, ".git")))
+            {
+                WriteLogLine(build.Id, $"$ git clone {job.RepoUrl} .");
+                if (!await RunGitAsync(workspaceDir, build.Id, ct, "clone", job.RepoUrl!, "."))
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                WriteLogLine(build.Id, "$ git fetch --prune origin");
+                if (!await RunGitAsync(workspaceDir, build.Id, ct, "fetch", "--prune", "origin"))
+                {
+                    return false;
+                }
+            }
+
+            string checkoutTarget;
+            if (!string.IsNullOrEmpty(build.CommitSha))
+            {
+                checkoutTarget = build.CommitSha;
+            }
+            else if (!string.IsNullOrEmpty(build.Branch))
+            {
+                checkoutTarget = $"origin/{build.Branch}";
+            }
+            else
+            {
+                WriteLogLine(build.Id, "$ git remote set-head origin --auto");
+                await RunGitAsync(workspaceDir, build.Id, ct, "remote", "set-head", "origin", "--auto");
+                checkoutTarget = "origin/HEAD";
+            }
+
+            WriteLogLine(build.Id, $"$ git checkout --force {checkoutTarget}");
+            if (!await RunGitAsync(workspaceDir, build.Id, ct, "checkout", "--force", checkoutTarget))
+            {
+                return false;
+            }
+
+            WriteLogLine(build.Id, "$ git clean -fdx");
+            await RunGitAsync(workspaceDir, build.Id, ct, "clean", "-fdx");
+
+            var resolvedSha = await CaptureGitOutputAsync(workspaceDir, ct, "rev-parse", "HEAD");
+            if (resolvedSha is not null)
+            {
+                build.CommitSha = resolvedSha.Trim();
+                _buildRepo.SetCommitInfo(build.Id, build.CommitSha, build.Branch);
+            }
+            return true;
+        }
+        catch (Exception ex)
+        {
+            WriteLogLine(build.Id, $"git checkout failed: {ex.Message}");
+            return false;
+        }
+    }
+
+    private async Task<bool> RunGitAsync(string workDir, long buildId, CancellationToken ct, params string[] args)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = _gitExePath,
+            WorkingDirectory = workDir,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+        };
+        foreach (var a in args)
+        {
+            psi.ArgumentList.Add(a);
+        }
+
+        using var process = Process.Start(psi) ?? throw new InvalidOperationException($"failed to start {_gitExePath}");
+        var stdoutTask = PumpStreamAsync(process.StandardOutput, buildId);
+        var stderrTask = PumpStreamAsync(process.StandardError, buildId);
+        await process.WaitForExitAsync(ct);
+        await Task.WhenAll(stdoutTask, stderrTask);
+        return process.ExitCode == 0;
+    }
+
+    private async Task<string?> CaptureGitOutputAsync(string workDir, CancellationToken ct, params string[] args)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = _gitExePath,
+            WorkingDirectory = workDir,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+        };
+        foreach (var a in args)
+        {
+            psi.ArgumentList.Add(a);
+        }
+
+        using var process = Process.Start(psi) ?? throw new InvalidOperationException($"failed to start {_gitExePath}");
+        var output = await process.StandardOutput.ReadToEndAsync(ct);
+        await process.WaitForExitAsync(ct);
+        return process.ExitCode == 0 ? output : null;
     }
 
     private static void ApplyDeclaredParameters(ProcessStartInfo psi, string parametersJson)

@@ -98,6 +98,41 @@ function Start-TestPipelineAsync {
     [PSCustomObject]@{ Process = $p; Fixture = $fixture }
 }
 
+function Invoke-TestHandler {
+    param(
+        [Parameter(Mandatory)][string]$HandlerContent,
+        [hashtable]$ExtraEnv = @{},
+        [string]$ShellPath = 'powershell.exe'
+    )
+
+    $fixture = New-CiTestFixture
+    $handlerPath = Join-Path $fixture.WorkDir 'handler.cipipe'
+    Set-Content -Path $handlerPath -Value $HandlerContent -Encoding utf8
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $ShellPath
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.WorkingDirectory = $fixture.Workspace
+    $psi.Arguments = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', "`"$script:BootstrapPath`"", '-PipelinePath', "`"$handlerPath`"", '-Mode', 'Handler') -join ' '
+    foreach ($k in $ExtraEnv.Keys) {
+        $psi.Environment[$k] = $ExtraEnv[$k]
+    }
+
+    $p = [System.Diagnostics.Process]::Start($psi)
+    $stdout = $p.StandardOutput.ReadToEnd()
+    $stderr = $p.StandardError.ReadToEnd()
+    $p.WaitForExit()
+
+    [PSCustomObject]@{
+        ExitCode = $p.ExitCode
+        Stdout   = $stdout
+        Stderr   = $stderr
+        Fixture  = $fixture
+    }
+}
+
 function Get-CiEvents {
     param([Parameter(Mandatory)][string]$ControlFile)
     if (-not (Test-Path $ControlFile)) {

@@ -14,7 +14,7 @@ public sealed class BuildRepository
     }
 
     /// <summary>Allocates the next build number for the job and inserts a Queued build. Serialized to avoid duplicate numbers.</summary>
-    public BuildRecord CreateQueued(long jobId, string trigger, string parametersJson, string? dedupKey)
+    public BuildRecord CreateQueued(long jobId, string trigger, string parametersJson, string? dedupKey, string? commitSha = null, string? branch = null)
     {
         lock (_numberLock)
         {
@@ -36,13 +36,15 @@ public sealed class BuildRepository
             {
                 cmd.Transaction = tx;
                 cmd.CommandText = """
-                    INSERT INTO builds (job_id, number, status, trigger, parameters, dedup_key, queued_at)
-                    VALUES ($jobId, $number, $status, $trigger, $parameters, $dedupKey, $queuedAt);
+                    INSERT INTO builds (job_id, number, status, trigger, parameters, dedup_key, commit_sha, branch, queued_at)
+                    VALUES ($jobId, $number, $status, $trigger, $parameters, $dedupKey, $commitSha, $branch, $queuedAt);
                     SELECT last_insert_rowid();
                     """;
                 cmd.Parameters.AddWithValue("$jobId", jobId);
                 cmd.Parameters.AddWithValue("$number", nextNumber);
                 cmd.Parameters.AddWithValue("$status", BuildStatus.Queued);
+                cmd.Parameters.AddWithValue("$commitSha", (object?)commitSha ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$branch", (object?)branch ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("$trigger", trigger);
                 cmd.Parameters.AddWithValue("$parameters", parametersJson);
                 cmd.Parameters.AddWithValue("$dedupKey", (object?)dedupKey ?? DBNull.Value);
@@ -103,6 +105,26 @@ public sealed class BuildRepository
             result.Add(Map(reader));
         }
         return result;
+    }
+
+    /// <summary>Most recent Queued/Waiting/Running build for this job+dedupKey, or null. Used for queue_policy (spec §5 F1/F3).</summary>
+    public BuildRecord? FindActiveByDedupKey(long jobId, string dedupKey)
+    {
+        using var conn = _db.OpenConnection();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT * FROM builds
+            WHERE job_id = $jobId AND dedup_key = $dedupKey
+                AND status IN ($queued, $waiting, $running)
+            ORDER BY queued_at DESC LIMIT 1
+            """;
+        cmd.Parameters.AddWithValue("$jobId", jobId);
+        cmd.Parameters.AddWithValue("$dedupKey", dedupKey);
+        cmd.Parameters.AddWithValue("$queued", BuildStatus.Queued);
+        cmd.Parameters.AddWithValue("$waiting", BuildStatus.Waiting);
+        cmd.Parameters.AddWithValue("$running", BuildStatus.Running);
+        using var reader = cmd.ExecuteReader();
+        return reader.Read() ? Map(reader) : null;
     }
 
     public BuildRecord? FindLatestByJob(long jobId)

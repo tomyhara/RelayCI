@@ -10,6 +10,7 @@ $script:PostStages = @()
 $script:PostPhase = $false
 $script:InStage = $false
 $script:InPostStage = $false
+$script:HandlerMode = $false
 
 function Write-CiEvent {
     [CmdletBinding()]
@@ -48,11 +49,20 @@ function Initialize-CiRunner {
     $script:PostPhase = $false
     $script:InStage = $false
     $script:InPostStage = $false
+    $script:HandlerMode = $false
     Write-CiEvent -EventType 'start' -Payload @{
         v         = 1
         pid       = $PID
         psVersion = $PSVersionTable.PSVersion.ToString()
     }
+}
+
+function Initialize-CiHandler {
+    [CmdletBinding()]
+    param()
+    # Handlers have no control file / stage lifecycle (DSL spec §10.1) - only Get-HookPayload,
+    # Get-HookHeader, Start-CiJob and Exec are meaningful here.
+    $script:HandlerMode = $true
 }
 
 function Test-CiStageHandled {
@@ -67,6 +77,9 @@ function Stage {
         [Parameter(Mandatory, Position = 0)][string]$Name,
         [Parameter(Mandatory, Position = 1)][scriptblock]$Body
     )
+    if ($script:HandlerMode) {
+        throw "Stage '$Name' cannot be called from a hook handler"
+    }
     if ($script:PostPhase) {
         throw "Stage '$Name' called after PostStage execution phase has begun"
     }
@@ -113,6 +126,9 @@ function PostStage {
         [ValidateSet('Success', 'Failure', 'Always')][string]$When = 'Always',
         [Parameter(Mandatory, Position = 1)][scriptblock]$Body
     )
+    if ($script:HandlerMode) {
+        throw "PostStage '$Name' cannot be called from a hook handler"
+    }
     if ($script:InStage) {
         throw "PostStage '$Name' cannot be called from within a Stage"
     }
@@ -211,6 +227,9 @@ function Register-JUnit {
         [Parameter(Mandatory, Position = 0)][string]$Glob,
         [switch]$Required
     )
+    if ($script:HandlerMode) {
+        throw 'Register-JUnit cannot be called from a hook handler'
+    }
     $files = Resolve-CiGlobPattern -Pattern $Glob
     if (-not $files -or $files.Count -eq 0) {
         $msg = "Register-JUnit: no files matched '$Glob'"
@@ -241,6 +260,9 @@ function Register-Artifact {
         [switch]$Required,
         [switch]$Flatten
     )
+    if ($script:HandlerMode) {
+        throw 'Register-Artifact cannot be called from a hook handler'
+    }
     $files = Resolve-CiGlobPattern -Pattern $Glob
     if (-not $files -or $files.Count -eq 0) {
         $msg = "Register-Artifact: no files matched '$Glob'"
@@ -303,6 +325,9 @@ function Set-CiEnv {
 function Set-BuildNote {
     [CmdletBinding()]
     param([Parameter(Mandatory, Position = 0)][string]$Text)
+    if ($script:HandlerMode) {
+        throw 'Set-BuildNote cannot be called from a hook handler'
+    }
     $t = $Text
     if ($t.Length -gt 200) {
         $t = $t.Substring(0, 200)
@@ -310,8 +335,52 @@ function Set-BuildNote {
     Write-CiEvent -EventType 'note' -Payload @{ text = $t }
 }
 
+function Get-HookPayload {
+    [CmdletBinding()]
+    param()
+    $path = $env:CI_HOOK_PAYLOAD
+    if (-not $path) {
+        throw 'Get-HookPayload: CI_HOOK_PAYLOAD is not set (not running inside a hook handler)'
+    }
+    Get-Content -Path $path -Raw -Encoding UTF8 | ConvertFrom-Json
+}
+
+function Get-HookHeader {
+    [CmdletBinding()]
+    param([Parameter(Mandatory, Position = 0)][string]$Name)
+    $path = $env:CI_HOOK_HEADERS
+    if (-not $path -or -not (Test-Path -Path $path)) {
+        return $null
+    }
+    $headers = Get-Content -Path $path -Raw -Encoding UTF8 | ConvertFrom-Json
+    $prop = $headers.PSObject.Properties | Where-Object { $_.Name -eq $Name } | Select-Object -First 1
+    if ($prop) { return $prop.Value } else { return $null }
+}
+
+function Start-CiJob {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, Position = 0)][string]$Name,
+        [hashtable]$Parameters = @{},
+        [string]$DedupKey
+    )
+    $serverUrl = $env:CI_SERVER_URL
+    if (-not $serverUrl) {
+        throw 'Start-CiJob: CI_SERVER_URL is not set (not running inside a hook handler)'
+    }
+    $body = @{ parameters = $Parameters; dedupKey = $DedupKey } | ConvertTo-Json -Compress -Depth 4
+    $uri = "$serverUrl/api/internal/start-job/$([Uri]::EscapeDataString($Name))"
+    try {
+        Invoke-RestMethod -Uri $uri -Method Post -Body $body -ContentType 'application/json'
+    }
+    catch {
+        throw "Start-CiJob: request failed: $($_.Exception.Message)"
+    }
+}
+
 Export-ModuleMember -Function @(
     'Initialize-CiRunner',
+    'Initialize-CiHandler',
     'Write-CiEvent',
     'Test-CiStageHandled',
     'Invoke-CiPostStages',
@@ -321,5 +390,8 @@ Export-ModuleMember -Function @(
     'Register-JUnit',
     'Register-Artifact',
     'Set-CiEnv',
-    'Set-BuildNote'
+    'Set-BuildNote',
+    'Get-HookPayload',
+    'Get-HookHeader',
+    'Start-CiJob'
 )

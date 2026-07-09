@@ -12,22 +12,28 @@ paths.EnsureCreated();
 var builder = WebApplication.CreateBuilder(args);
 builder.WebHost.UseUrls($"http://{config.Bind}:{config.Port}");
 
+var serverUrl = $"http://localhost:{config.Port}";
+
 builder.Services.AddSingleton(config);
 builder.Services.AddSingleton(paths);
 builder.Services.AddSingleton(new CiDatabase(paths.DbPath));
 builder.Services.AddSingleton<JobRepository>();
 builder.Services.AddSingleton<BuildRepository>();
 builder.Services.AddSingleton<SettingsRepository>();
+builder.Services.AddSingleton<HookRepository>();
+builder.Services.AddSingleton<HookRunRepository>();
 builder.Services.AddSingleton<LiveLogHub>();
 builder.Services.AddSingleton<GlobalEventHub>();
 builder.Services.AddSingleton<JobScanner>();
+builder.Services.AddSingleton<HookScanner>();
 builder.Services.AddSingleton(sp => new BuildRunner(
     paths,
     sp.GetRequiredService<BuildRepository>(),
     sp.GetRequiredService<LiveLogHub>(),
     sp.GetRequiredService<GlobalEventHub>(),
     Path.Combine(AppContext.BaseDirectory, "psmodule", "bootstrap.ps1"),
-    $"http://localhost:{config.Port}"));
+    serverUrl,
+    config.Git.ExePath));
 builder.Services.AddSingleton(sp =>
 {
     var executorLimit = sp.GetRequiredService<SettingsRepository>().GetInt("executors", 2);
@@ -39,11 +45,40 @@ builder.Services.AddSingleton(sp =>
         executorLimit);
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<BuildDispatcher>());
+builder.Services.AddSingleton<JobTriggerService>();
+builder.Services.AddSingleton(sp => new HandlerRunner(
+    paths,
+    sp.GetRequiredService<HookRunRepository>(),
+    Path.Combine(AppContext.BaseDirectory, "psmodule", "bootstrap.ps1"),
+    serverUrl));
+builder.Services.AddSingleton(sp =>
+{
+    var concurrency = sp.GetRequiredService<SettingsRepository>().GetInt("handlerConcurrency", 4);
+    return new WebhookReceiver(
+        paths,
+        sp.GetRequiredService<HookRepository>(),
+        sp.GetRequiredService<HookRunRepository>(),
+        sp.GetRequiredService<HandlerRunner>(),
+        concurrency);
+});
+builder.Services.AddSingleton(sp =>
+{
+    var intervalSec = sp.GetRequiredService<SettingsRepository>().GetInt("pollingIntervalSec", 60);
+    return new PollingService(
+        sp.GetRequiredService<JobRepository>(),
+        sp.GetRequiredService<JobTriggerService>(),
+        config.Git.ExePath,
+        intervalSec);
+});
+builder.Services.AddHostedService(sp => sp.GetRequiredService<PollingService>());
+builder.Services.AddSingleton<CronScheduler>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<CronScheduler>());
 
 var app = builder.Build();
 
 app.Services.GetRequiredService<CiDatabase>().Migrate();
 app.Services.GetRequiredService<JobScanner>().ScanAndRegister();
+app.Services.GetRequiredService<HookScanner>().ScanAndRegister();
 
 app.UseDefaultFiles();
 app.UseStaticFiles();
@@ -104,16 +139,56 @@ app.MapGet("/api/jobs/{name}/builds", (string name, JobRepository jobRepo, Build
     return Results.Ok(builds);
 });
 
-app.MapPost("/api/jobs/{name}/trigger", (string name, JobRepository jobRepo, BuildRepository buildRepo, BuildDispatcher dispatcher) =>
+app.MapPost("/api/jobs/{name}/trigger", (string name, TriggerRequest? body, JobTriggerService triggerService) =>
 {
-    var job = jobRepo.FindByName(name);
-    if (job is null || !job.Enabled)
+    var result = triggerService.Trigger(name, BuildTrigger.Manual, body?.Parameters, dedupKey: null);
+    if (!result.Queued && result.Reason == "job-not-found-or-disabled")
     {
         return Results.NotFound();
     }
-    var build = buildRepo.CreateQueued(job.Id, BuildTrigger.Manual, "{}", dedupKey: null);
-    dispatcher.Signal();
-    return Results.Ok(MapBuildSummary(build));
+    if (!result.Queued)
+    {
+        return Results.BadRequest(new { error = result.Reason });
+    }
+    return Results.Ok(MapBuildSummary(result.Build));
+});
+
+app.MapPost("/api/internal/start-job/{name}", (string name, StartJobRequest? body, JobTriggerService triggerService, HookRunRepository hookRunRepo) =>
+{
+    var result = triggerService.Trigger(name, BuildTrigger.Hook, body?.Parameters, body?.DedupKey);
+    if (!result.Queued && result.Reason == "job-not-found-or-disabled")
+    {
+        return Results.NotFound();
+    }
+
+    if (result.Queued && body?.HookRunId is { } hookRunId && result.Build is not null)
+    {
+        hookRunRepo.AppendTriggeredBuild(hookRunId, result.Build.Id);
+    }
+
+    return Results.Ok(new
+    {
+        Queued = result.Queued,
+        BuildNumber = result.Build?.Number,
+        Url = result.Build is null ? null : $"{serverUrl}/#/builds/{result.Build.Id}",
+        Reason = result.Reason,
+    });
+});
+
+app.MapPost("/api/webhook/{name}", async (string name, HttpRequest request, WebhookReceiver receiver) =>
+{
+    using var ms = new MemoryStream();
+    await request.Body.CopyToAsync(ms);
+    var body = ms.ToArray();
+    var headers = request.Headers.ToDictionary(h => h.Key, h => h.Value.ToString(), StringComparer.OrdinalIgnoreCase);
+
+    var result = await receiver.ReceiveAsync(name, body, headers, request.HttpContext.RequestAborted);
+    return result switch
+    {
+        WebhookReceiveResult.HookNotFound => Results.NotFound(),
+        WebhookReceiveResult.Unauthorized => Results.Unauthorized(),
+        _ => Results.Ok(),
+    };
 });
 
 app.MapGet("/api/builds/{id:long}", (long id, BuildRepository buildRepo, JobRepository jobRepo) =>
@@ -235,3 +310,15 @@ static object? MapBuildSummary(BuildRecord? b) => b is null ? null : new
     b.StartedAt,
     b.FinishedAt,
 };
+
+sealed class TriggerRequest
+{
+    public Dictionary<string, string>? Parameters { get; set; }
+}
+
+sealed class StartJobRequest
+{
+    public Dictionary<string, string>? Parameters { get; set; }
+    public string? DedupKey { get; set; }
+    public long? HookRunId { get; set; }
+}

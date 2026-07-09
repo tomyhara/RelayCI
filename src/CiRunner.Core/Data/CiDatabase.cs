@@ -169,5 +169,6 @@ public sealed class CiDatabase
         CREATE INDEX IF NOT EXISTS idx_build_steps_build ON build_steps(build_id, seq);
         CREATE INDEX IF NOT EXISTS idx_test_results_build ON test_results(build_id);
         CREATE INDEX IF NOT EXISTS idx_hook_runs_hook ON hook_runs(hook_id, received_at);
+        CREATE INDEX IF NOT EXISTS idx_hook_runs_delivery ON hook_runs(hook_id, delivery_id);
         """;
 }

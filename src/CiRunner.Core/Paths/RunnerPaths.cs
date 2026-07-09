@@ -13,6 +13,9 @@ public sealed class RunnerPaths
     public string ControlFilesDir => Path.Combine(DataDir, "control");
     public string ResultsDir => Path.Combine(DataDir, "results");
     public string ArtifactsDir => Path.Combine(DataDir, "artifacts");
+    public string HookScriptsDir => Path.Combine(HooksDir, "scripts");
+    public string HookPayloadsDir => Path.Combine(DataDir, "hook-payloads");
+    public string HookLogsDir => Path.Combine(LogsDir, "hooks");
 
     public RunnerPaths(string root)
     {
@@ -25,9 +28,13 @@ public sealed class RunnerPaths
     public string JobLogsDir(string jobName) => Path.Combine(LogsDir, jobName);
     public string BuildLogPath(string jobName, int buildNumber) => Path.Combine(JobLogsDir(jobName), $"{buildNumber}.log");
 
+    public string HookHandlerPath(string hookName) => Path.Combine(HooksDir, $"{hookName}.cipipe");
+    public string HookConfigPath(string hookName) => Path.Combine(HooksDir, $"{hookName}.json");
+    public string HookRunLogPath(long hookRunId) => Path.Combine(HookLogsDir, $"{hookRunId}.log");
+
     public void EnsureCreated()
     {
-        foreach (var dir in new[] { DataDir, JobsDir, HooksDir, WorkspacesDir, LogsDir, ControlFilesDir, ResultsDir, ArtifactsDir })
+        foreach (var dir in new[] { DataDir, JobsDir, HooksDir, HookScriptsDir, HookPayloadsDir, HookLogsDir, WorkspacesDir, LogsDir, ControlFilesDir, ResultsDir, ArtifactsDir })
         {
             Directory.CreateDirectory(dir);
         }
