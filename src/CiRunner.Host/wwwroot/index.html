@@ -495,6 +495,7 @@ async function renderJobsList(){
             <span class="mono" style="font-size:9px;padding:1px 5px;border-radius:4px;background:var(--surface-3);color:var(--text-3);text-transform:uppercase">${esc(job.pipelineSource)}</span>
           </div>
           <div class="mono" style="font-size:10.5px;color:var(--text-3)">${esc(job.repoUrl || 'no repository')}</div>
+          ${job.nextRunAt ? `<div class="mono" style="font-size:10.5px;color:var(--text-3)" data-testid="next-run">Next run: ${esc(fmtTime(job.nextRunAt))}</div>` : ''}
         </div>
       </div>
       <div>
@@ -1250,7 +1251,11 @@ async function renderJobForm(el){
         <div><label>Timeout override (minutes)</label><input type="number" id="jf-timeoutMinutes" value="${job?.timeoutMinutes ?? ''}" placeholder="system default"></div>
         <div><label>Retention override (builds)</label><input type="number" id="jf-retention" value="${job?.retention ?? ''}" placeholder="system default"></div>
         <div class="formrow-check" style="padding-top:22px"><input type="checkbox" id="jf-enabled" ${(!job || job.enabled) ? 'checked' : ''}> <label style="margin:0" for="jf-enabled">Enabled</label></div>
-        <div class="full"><label>Cron Schedules (one per line)</label><textarea id="jf-cron">${esc(cronList.join('\n'))}</textarea></div>
+        <div class="full">
+          <label>Cron Schedules (one per line)</label>
+          <textarea id="jf-cron" oninput="onCronScheduleInput()">${esc(cronList.join('\n'))}</textarea>
+          <div class="mono sub" data-testid="cron-preview" id="jf-cron-preview" style="margin-top:6px;font-size:11px;min-height:14px"></div>
+        </div>
         <div class="full"><label>Polling Branches (one per line)</label><textarea id="jf-polling">${esc(pollList.join('\n'))}</textarea></div>
         <div class="full"><label>Resources (comma separated)</label><input type="text" id="jf-resources" value="${esc(resourcesList.join(', '))}"></div>
         <div class="full">
@@ -1266,6 +1271,46 @@ async function renderJobForm(el){
       </div>
     </div>`;
   renderJobParamRows();
+  renderCronSchedulePreview();
+}
+
+/* ---------- cron next-run preview (spec §5 F1b, test-spec E2E-019) ---------- */
+let cronPreviewTimer = null;
+let cronPreviewSeq = 0;
+
+function onCronScheduleInput(){
+  clearTimeout(cronPreviewTimer);
+  cronPreviewTimer = setTimeout(renderCronSchedulePreview, 300);
+}
+
+async function renderCronSchedulePreview(){
+  const el = document.getElementById('jf-cron-preview');
+  const textarea = document.getElementById('jf-cron');
+  if (!el || !textarea) return;
+  const lines = textarea.value.split('\n').map(s => s.trim()).filter(Boolean);
+  const mySeq = ++cronPreviewSeq;
+  if (lines.length === 0) { el.textContent = ''; el.style.color = ''; return; }
+
+  const parts = [];
+  for (const expr of lines) {
+    let res;
+    try {
+      res = await fetch(`/api/admin/cron/preview?expr=${encodeURIComponent(expr)}`);
+    } catch (e) {
+      return; // network hiccup; leave the previous preview in place
+    }
+    if (mySeq !== cronPreviewSeq) return; // a newer keystroke superseded this request
+    if (!res.ok) {
+      const b = await res.json().catch(() => ({}));
+      el.textContent = `${expr}: ${b.error || 'invalid cron expression'}`;
+      el.style.color = 'var(--st-failed)';
+      return;
+    }
+    const body = await res.json();
+    parts.push(`${expr} → ${body.occurrences.map(fmtTime).join(', ')}`);
+  }
+  el.style.color = '';
+  el.innerHTML = parts.map(esc).join('<br>');
 }
 
 function renderJobParamRows(){

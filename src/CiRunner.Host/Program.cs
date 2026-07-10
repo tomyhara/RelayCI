@@ -449,6 +449,23 @@ app.MapPost("/api/admin/jobs/import", (JobAdminRequest? body, JobRepository jobR
     return Results.Ok(job);
 }).RequireAuthorization("Admin");
 
+// ---- F1b: cron next-run preview (spec §5 F1b "次回発火時刻のプレビュー", test-spec E2E-019) ----
+// A standalone endpoint (rather than tied to a job name) so the job form can preview a schedule the
+// user just typed, before it's ever saved.
+app.MapGet("/api/admin/cron/preview", (string? expr) =>
+{
+    if (string.IsNullOrWhiteSpace(expr))
+    {
+        return Results.BadRequest(new { error = "expr is required" });
+    }
+    if (!CronScheduler.TryParse(expr, out var cron, out var error))
+    {
+        return Results.BadRequest(new { error });
+    }
+    var occurrences = CronScheduler.GetNextOccurrences(cron, DateTimeOffset.Now, 3);
+    return Results.Ok(new { occurrences });
+}).RequireAuthorization("Admin");
+
 // ---- F6: hook management (spec §5 F6 "フック管理") ----
 
 app.MapGet("/api/admin/hooks", (HookRepository hookRepo) => Results.Ok(hookRepo.ListEnabled().Select(MapHookForAdmin)))
@@ -596,6 +613,8 @@ app.MapGet("/api/jobs", (JobRepository jobRepo, BuildRepository buildRepo) =>
         Parameters = ParseJobParameters(j.Parameters),
         LatestBuild = MapBuildSummary(buildRepo.FindLatestByJob(j.Id)),
         RecentBuilds = buildRepo.ListByJob(j.Id, 10).Select(b => new { b.Number, b.Status }),
+        // Spec §5 F1b "ジョブ一覧に次回実行時刻を表示" (E2E-019): null for jobs with no cron schedules.
+        NextRunAt = ComputeNextRunAt(j),
     });
     return Results.Ok(jobs);
 }).RequireAuthorization("Viewer");
@@ -941,7 +960,57 @@ static string? ValidateJobRequest(JobAdminRequest body)
     {
         return "queuePolicy must be 'queue' or 'replace'";
     }
+    // Spec §5 F1b / test-spec TMR-005: reject a malformed cron expression at config time rather than
+    // letting it silently never fire (CronScheduler.CheckOnce just skips schedules it can't parse). A
+    // job can declare several schedules (TMR-002), so every one of them is checked.
+    if (body.CronSchedules is not null)
+    {
+        foreach (var expr in body.CronSchedules)
+        {
+            if (!CronScheduler.TryParse(expr, out _, out var cronError))
+            {
+                return $"invalid cron expression '{expr}': {cronError}";
+            }
+        }
+    }
     return null;
+}
+
+/// <summary>Spec §5 F1b "次回発火時刻": the soonest upcoming occurrence across all of a job's cron
+/// schedules, or null if it has none / none currently parse. Malformed schedules are skipped here
+/// rather than thrown - job create/update already rejects those (TMR-005), but a job.json hand-edited
+/// on disk could still contain one, and this must not break the jobs list over it.</summary>
+static DateTimeOffset? ComputeNextRunAt(JobRecord job)
+{
+    List<string>? schedules;
+    try
+    {
+        schedules = JsonSerializer.Deserialize<List<string>>(job.CronSchedules);
+    }
+    catch (JsonException)
+    {
+        return null;
+    }
+    if (schedules is null || schedules.Count == 0)
+    {
+        return null;
+    }
+
+    DateTimeOffset? earliest = null;
+    var now = DateTimeOffset.Now;
+    foreach (var expr in schedules)
+    {
+        if (!CronScheduler.TryParse(expr, out var cron, out _))
+        {
+            continue;
+        }
+        var next = cron.GetNextOccurrence(now, TimeZoneInfo.Local);
+        if (next is { } occurrence && (earliest is null || occurrence < earliest))
+        {
+            earliest = occurrence;
+        }
+    }
+    return earliest;
 }
 
 /// <summary>Applies a job create/update to both the DB and jobs/&lt;name&gt;/job.json, so the next

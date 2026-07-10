@@ -72,7 +72,7 @@ public sealed class CronScheduler : BackgroundService
 
             foreach (var expr in schedules)
             {
-                if (!TryParse(expr, out var cron))
+                if (!TryParse(expr, out var cron, out _))
                 {
                     continue;
                 }
@@ -89,17 +89,42 @@ public sealed class CronScheduler : BackgroundService
         }
     }
 
-    private static bool TryParse(string expr, out CronExpression cron)
+    /// <summary>Parses a 5-field cron expression (spec §5 F1b "5 フィールド: 分 時 日 月 曜日"). Shared by
+    /// the scheduler loop above and by the admin API (job create/update validation, TMR-005; and the
+    /// next-run preview, E2E-019) so both agree on exactly which expressions are accepted.</summary>
+    public static bool TryParse(string expr, out CronExpression cron, out string? error)
     {
         try
         {
             cron = CronExpression.Parse(expr);
+            error = null;
             return true;
         }
-        catch (CronFormatException)
+        catch (CronFormatException ex)
         {
             cron = null!;
+            error = ex.Message;
             return false;
         }
+    }
+
+    /// <summary>The next <paramref name="count"/> occurrences of <paramref name="cron"/> strictly after
+    /// <paramref name="from"/>, in local time. Used by the cron preview API (E2E-019 "次回発火時刻の
+    /// プレビュー"); stops early if the expression has no further occurrences (Cronos returns null).</summary>
+    public static List<DateTimeOffset> GetNextOccurrences(CronExpression cron, DateTimeOffset from, int count)
+    {
+        var results = new List<DateTimeOffset>(count);
+        var cursor = from;
+        for (var i = 0; i < count; i++)
+        {
+            var next = cron.GetNextOccurrence(cursor, TimeZoneInfo.Local);
+            if (next is null)
+            {
+                break;
+            }
+            results.Add(next.Value);
+            cursor = next.Value;
+        }
+        return results;
     }
 }
