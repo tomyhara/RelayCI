@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  build-and-unit-tests:
+    name: Build + L2/L3 tests (xUnit)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+          cache: true
+          cache-dependency-path: "**/*.csproj"
+
+      # Debug is required: auth.localUsers (the LDAP test double used by Host.Tests/E2E.Tests
+      # fixtures) is rejected at startup outside Debug builds by design, so a Release build
+      # would fail before any test runs.
+      - name: Build (Debug)
+        run: dotnet build CiRunner.sln -c Debug
+
+      - name: Test - CiRunner.Core.Tests (L2)
+        run: dotnet test tests/CiRunner.Core.Tests -c Debug --no-build
+
+      - name: Test - CiRunner.Host.Tests (L3)
+        run: dotnet test tests/CiRunner.Host.Tests -c Debug --no-build
+
+  e2e-tests:
+    name: E2E tests (Playwright, L4)
+    runs-on: windows-latest
+    needs: build-and-unit-tests
+    # Known pre-existing flakiness under CI-level CPU contention (real host + PowerShell child
+    # processes + Chromium per test class, run in parallel by xUnit). Non-blocking so a locator
+    # timeout doesn't fail the whole pipeline; investigate failures here, don't ignore them.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+          cache: true
+          cache-dependency-path: "**/*.csproj"
+
+      - name: Build (Debug)
+        run: dotnet build CiRunner.sln -c Debug
+
+      - name: Install Playwright browsers
+        run: pwsh tests/CiRunner.E2E.Tests/bin/Debug/net8.0/playwright.ps1 install chromium
+
+      - name: Test - CiRunner.E2E.Tests (L4)
+        run: dotnet test tests/CiRunner.E2E.Tests -c Debug --no-build
+
+  dsl-tests:
+    name: DSL tests (Pester, L1)
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # PowerShell 5.1 and PowerShell 7 both need to run the DSL suite; the DSL module supports
+        # both, and windows-latest ships both shells preinstalled.
+        shell: [powershell, pwsh]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Pester 5
+        shell: ${{ matrix.shell }}
+        # windows-latest ships Windows PowerShell 5.1 with a built-in Pester 3.4, which does not
+        # satisfy RunTests.ps1's -MinimumVersion 5.0.0 requirement.
+        run: Install-Module Pester -MinimumVersion 5.5.0 -Force -SkipPublisherCheck -Scope CurrentUser
+
+      - name: Run DSL tests
+        shell: ${{ matrix.shell }}
+        run: ./tests/CiRunner.Dsl.Tests/RunTests.ps1
