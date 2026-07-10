@@ -368,7 +368,14 @@ function Start-CiJob {
     if (-not $serverUrl) {
         throw 'Start-CiJob: CI_SERVER_URL is not set (not running inside a hook handler)'
     }
-    $body = @{ parameters = $Parameters; dedupKey = $DedupKey } | ConvertTo-Json -Compress -Depth 4
+    $payload = @{ parameters = $Parameters; dedupKey = $DedupKey }
+    if ($env:CI_HOOK_RUN_ID) {
+        # Set by HandlerRunner for webhook handlers: lets the server attribute the triggered build
+        # back to this hook_run (hook_runs.triggered_builds), powering the admin UI's run-history
+        # "triggered builds" links (spec §5 F1 "起動したビルドへのリンク").
+        $payload.hookRunId = [long]$env:CI_HOOK_RUN_ID
+    }
+    $body = $payload | ConvertTo-Json -Compress -Depth 4
     $uri = "$serverUrl/api/internal/start-job/$([Uri]::EscapeDataString($Name))"
     try {
         Invoke-RestMethod -Uri $uri -Method Post -Body $body -ContentType 'application/json'
