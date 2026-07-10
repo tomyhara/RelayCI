@@ -175,6 +175,20 @@ h1{font-size:22px;margin:0 0 3px}
 .formrow-check{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--text-2)}
 .paramrow{display:grid;grid-template-columns:1fr 1fr 1.4fr auto auto;gap:8px;margin-bottom:6px;align-items:center}
 .paramrow input{padding:6px 8px;background:var(--surface-2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px}
+
+/* Parameterized manual-trigger modal (spec §5 F1a). No modal component existed; this reuses the
+   surface/border/accent tokens and .btn styling of the rest of the UI. */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:50;padding:20px;animation:rc-fade .15s ease}
+.modal{width:440px;max-width:100%;max-height:88vh;overflow-y:auto;background:var(--surface);border:1px solid var(--border);border-radius:12px;box-shadow:var(--shadow);padding:20px 22px}
+.param-field{margin-bottom:14px}
+.param-field label{display:block;font-size:11.5px;color:var(--text-2);margin-bottom:5px}
+.param-field label .req{color:var(--st-failed);margin-left:2px}
+.param-field input{width:100%;padding:8px 10px;background:var(--surface-2);border:1px solid var(--border);border-radius:7px;color:var(--text);font-size:13px;outline:none}
+.param-field input:focus{border-color:var(--accent)}
+.param-field .hint-text{font-size:11px;color:var(--text-3);margin-top:4px}
+.param-field .param-error{font-size:11px;color:var(--st-failed);margin-top:4px;display:none}
+.param-field.invalid input{border-color:var(--st-failed)}
+.param-field.invalid .param-error{display:block}
 </style>
 </head>
 <body>
@@ -499,10 +513,116 @@ async function renderJobsList(){
 }
 
 async function triggerJob(name){
+  // Spec §5 F1a: a job with declared parameters prompts for them first (defaults prefilled, required
+  // fields validated); a parameterless job keeps the immediate one-click behavior existing tests rely
+  // on. /api/jobs (Viewer+) is the source of parameter defs so operators can trigger too.
+  let params = [];
+  try {
+    const jobs = await api('/api/jobs');
+    const job = jobs.find(j => j.name === name);
+    params = (job && job.parameters) || [];
+  } catch (e) { /* if the lookup fails, fall through to a plain trigger */ }
+  if (params.length > 0) { openParamModal(name, params); return; }
   await api(`/api/jobs/${encodeURIComponent(name)}/trigger`, {method:'POST'});
+  afterTrigger(name);
+}
+
+function afterTrigger(name){
   if (currentPath() === '/jobs') renderJobsList();
   else if (currentPath() === '/jobs/'+encodeURIComponent(name)) renderJobHistory({name});
 }
+
+/* ---------- parameterized manual trigger modal (spec §5 F1a) ---------- */
+let paramModalEl = null;
+
+function openParamModal(name, params){
+  closeParamModal();
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.setAttribute('data-testid', 'param-form');
+  overlay.innerHTML = `
+    <div class="modal fade" role="dialog" aria-modal="true" aria-label="Run ${esc(name)}">
+      <h2 class="display" style="font-size:16px;margin:0 0 4px">Run ${esc(name)}</h2>
+      <p class="sub" style="margin:0 0 16px">Set the parameters for this build.</p>
+      <form autocomplete="off">
+        <div>${params.map(renderParamField).join('')}</div>
+        <div class="login-error" id="param-modal-error" style="display:none;margin-top:4px"></div>
+        <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:18px">
+          <button type="button" class="btn" data-testid="param-cancel-btn">Cancel</button>
+          <button type="submit" class="btn primary" data-testid="param-run-btn">Run</button>
+        </div>
+      </form>
+    </div>`;
+  document.body.appendChild(overlay);
+  paramModalEl = overlay;
+
+  overlay.querySelector('form').addEventListener('submit', ev => { ev.preventDefault(); submitParamForm(name, params); });
+  overlay.querySelector('[data-testid=param-cancel-btn]').addEventListener('click', closeParamModal);
+  // Click outside the dialog (on the overlay itself) or Escape cancels without triggering.
+  overlay.addEventListener('mousedown', ev => { if (ev.target === overlay) closeParamModal(); });
+  document.addEventListener('keydown', paramModalKeyHandler);
+  // Live-clear a required field's error as soon as the user starts typing.
+  overlay.querySelectorAll('.param-field input').forEach(inp =>
+    inp.addEventListener('input', () => inp.closest('.param-field').classList.remove('invalid')));
+
+  const first = overlay.querySelector('.param-field input');
+  if (first) first.focus();
+}
+
+function renderParamField(p){
+  return `
+    <div class="param-field">
+      <label>${esc(p.name)}${p.required ? '<span class="req">*</span>' : ''}</label>
+      <input data-testid="param-input-${esc(p.name)}" value="${esc(p.default ?? '')}" autocomplete="off" spellcheck="false">
+      ${p.description ? `<div class="hint-text">${esc(p.description)}</div>` : ''}
+      <div class="param-error">${esc(p.name)} is required.</div>
+    </div>`;
+}
+
+function submitParamForm(name, params){
+  if (!paramModalEl) return;
+  // .param-field nodes are in the same order as params (document order), so index them by position
+  // rather than by name selector - parameter names are unrestricted and may contain awkward chars.
+  const fields = paramModalEl.querySelectorAll('.param-field');
+  const parameters = {};
+  let firstInvalid = null;
+  params.forEach((p, i) => {
+    const input = fields[i].querySelector('input');
+    const value = input.value;
+    const missing = p.required && value.trim() === '';
+    fields[i].classList.toggle('invalid', missing);
+    if (missing && !firstInvalid) firstInvalid = input;
+    parameters[p.name] = value;
+  });
+  if (firstInvalid) { firstInvalid.focus(); return; } // block submit while a required field is empty
+  runWithParameters(name, parameters);
+}
+
+async function runWithParameters(name, parameters){
+  const runBtn = paramModalEl && paramModalEl.querySelector('[data-testid=param-run-btn]');
+  const errEl = paramModalEl && paramModalEl.querySelector('#param-modal-error');
+  if (errEl) errEl.style.display = 'none';
+  if (runBtn) runBtn.disabled = true;
+  try {
+    await api(`/api/jobs/${encodeURIComponent(name)}/trigger`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ parameters }),
+    });
+  } catch (e) {
+    if (runBtn) runBtn.disabled = false;
+    if (errEl) { errEl.textContent = 'Trigger failed: ' + e.message; errEl.style.display = 'block'; }
+    return;
+  }
+  closeParamModal();
+  afterTrigger(name);
+}
+
+function closeParamModal(){
+  if (paramModalEl) { paramModalEl.remove(); paramModalEl = null; }
+  document.removeEventListener('keydown', paramModalKeyHandler);
+}
+function paramModalKeyHandler(ev){ if (ev.key === 'Escape') closeParamModal(); }
 
 /* ================= JOB HISTORY ================= */
 route('/jobs/:name', renderJobHistory);
@@ -605,6 +725,10 @@ async function refreshBuildDetail(scaffold){
           <span><span style="color:var(--text-3)">queued</span> ${fmtTime(build.queuedAt)}</span>
           <span><span style="color:var(--text-3)">duration</span> ${fmtDuration(build.startedAt, build.finishedAt)}</span>
         </div>
+        ${build.parameters && Object.keys(build.parameters).length ? `
+        <div data-testid="build-params" style="margin-top:10px;display:flex;flex-wrap:wrap;gap:6px">
+          ${Object.entries(build.parameters).map(([k,v]) => `<span class="mono" style="font-size:11px;padding:3px 9px;border-radius:6px;background:var(--surface-2);border:1px solid var(--border)"><span style="color:var(--text-3)">${esc(k)}</span> = ${esc(v)}</span>`).join('')}
+        </div>` : ''}
         ${build.note ? `<div style="margin-top:9px;display:inline-flex;align-items:center;gap:7px;font-size:12px;color:var(--text-2);background:var(--surface-2);border:1px solid var(--border);padding:4px 10px;border-radius:6px"><span style="color:var(--st-running)">&#10022;</span>${esc(build.note)}</div>` : ''}
       </div>
       <div style="display:flex;gap:8px">

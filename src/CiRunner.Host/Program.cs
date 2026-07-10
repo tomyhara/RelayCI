@@ -591,6 +591,9 @@ app.MapGet("/api/jobs", (JobRepository jobRepo, BuildRepository buildRepo) =>
         j.Enabled,
         j.RepoUrl,
         j.PipelineSource,
+        // Spec §5 F1a: surface each job's declared parameter definitions so a manual trigger can decide
+        // whether to prompt with an input form (defaults/required) rather than firing one-click.
+        Parameters = ParseJobParameters(j.Parameters),
         LatestBuild = MapBuildSummary(buildRepo.FindLatestByJob(j.Id)),
         RecentBuilds = buildRepo.ListByJob(j.Id, 10).Select(b => new { b.Number, b.Status }),
     });
@@ -746,6 +749,9 @@ app.MapGet("/api/builds/{id:long}", (long id, BuildRepository buildRepo, JobRepo
         build.Status,
         build.Trigger,
         build.Note,
+        // Spec §5 F1a: "使用したパラメータは builds.parameters に JSON 保存し、ビルド詳細に表示" - the
+        // parameters the build actually ran with, as a {name:value} object ({} when it declared none).
+        Parameters = ParseBuildParameters(build.Parameters),
         build.QueuedAt,
         build.StartedAt,
         build.FinishedAt,
@@ -866,6 +872,22 @@ static object? MapBuildSummary(BuildRecord? b) => b is null ? null : new
     b.StartedAt,
     b.FinishedAt,
 };
+
+/// <summary>Spec §5 F1a: a job's declared parameter definitions (jobs.parameters). Defensive parse so
+/// a malformed column yields no parameters rather than failing the whole jobs listing.</summary>
+static List<JobParameterDef> ParseJobParameters(string json)
+{
+    try { return JsonSerializer.Deserialize<List<JobParameterDef>>(json) ?? new(); }
+    catch (JsonException) { return new(); }
+}
+
+/// <summary>Spec §5 F1a: the parameters a build actually ran with (builds.parameters, a {name:value}
+/// JSON object). Empty object when the build declared none or the column is malformed.</summary>
+static Dictionary<string, string> ParseBuildParameters(string json)
+{
+    try { return JsonSerializer.Deserialize<Dictionary<string, string>>(json) ?? new(); }
+    catch (JsonException) { return new(); }
+}
 
 /// <summary>Spec §5 F3a: for a Waiting build, which of its declared resources are held and by which
 /// other build. Null (rather than an empty list) when nothing is actually contended, e.g. a build
