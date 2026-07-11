@@ -61,12 +61,20 @@ jobs:
           -Path publish/CiRunner.Host/*
           -DestinationPath RelayCI-${{ steps.version.outputs.version }}-win-x64.zip
 
-      - name: Create GitHub Release
+      # Idempotent: a tag created through the GitHub UI's "Create a new release" flow publishes
+      # an (asset-less, note-less) release together with the tag, which would make a plain
+      # `gh release create` fail with "a release with the same tag name already exists". Update
+      # that release in place instead of erroring out.
+      - name: Create or update GitHub Release
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${{ steps.version.outputs.tag }}" \
-            "RelayCI-${{ steps.version.outputs.version }}-win-x64.zip" \
-            --title "RelayCI ${{ steps.version.outputs.tag }}" \
-            --generate-notes
+          asset="RelayCI-${{ steps.version.outputs.version }}-win-x64.zip"
+          tag="${{ steps.version.outputs.tag }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" --title "RelayCI $tag" --generate-notes
+            gh release upload "$tag" "$asset" --clobber
+          else
+            gh release create "$tag" "$asset" --title "RelayCI $tag" --generate-notes
+          fi

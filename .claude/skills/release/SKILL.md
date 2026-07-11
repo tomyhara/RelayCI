@@ -72,5 +72,16 @@ REST API from this session - neither is available here.
   --self-contained` output - Release (not Debug) is correct and required here: the Debug-only
   `auth.localUsers` LDAP test double is refused at startup in Release builds by design (spec §9),
   which is exactly the behavior a distributable build should have.
-- This repo has no branch protection automation visible to these tools; still, don't tag off a
-  branch other than `main` without the user asking for it explicitly (e.g. a hotfix branch).
+- The release-creation step is idempotent (`gh release view` then `edit`+`upload --clobber` vs.
+  `create`): if a tag was created through the GitHub UI's "Create a new release" flow, GitHub
+  already published an asset-less, note-less release alongside the tag, and a plain
+  `gh release create` would fail with "a release with the same tag name already exists". Re-running
+  the workflow against an existing tag/release fills in the notes and asset rather than erroring.
+- This repo has a tag ruleset (`refs/tags/**` or similar under Settings -> Rules) that has, in
+  practice, blocked this session's `git push origin vX.Y.Z` with a plain HTTP 403 even after the
+  legacy Tag protection rules screen was relaxed - the two are separate GitHub features. If a tag
+  push 403s, don't loop on retries: ask the user to check Settings -> Rules -> Rule Insights for
+  the specific rule/actor blocking it, or have them create the tag directly (e.g. via the GitHub
+  UI) and continue from step 6 above once it exists on the remote.
+- Don't tag off a branch other than `main` without the user asking for it explicitly (e.g. a
+  hotfix branch).
