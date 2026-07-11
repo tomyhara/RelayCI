@@ -112,6 +112,20 @@ public class BuildDispatcherTests
         }
     }
 
+    private static async Task WaitUntilStatusAsync(EngineFixture fx, long buildId, string status, TimeSpan timeout)
+    {
+        using var cts = new CancellationTokenSource(timeout);
+        while (!cts.IsCancellationRequested)
+        {
+            if (fx.Builds.FindById(buildId)!.Status == status)
+            {
+                return;
+            }
+            await Task.Delay(25, CancellationToken.None);
+        }
+        throw new TimeoutException($"Build {buildId} did not reach status '{status}' in time.");
+    }
+
     private static JobConfigInput ConfigWithResources(string name, string[] resources) => new(
         Name: name, RepoUrl: null, WorkspacePath: null, PipelineSource: "server", PipelinePath: "pipeline.cipipe",
         ParametersJson: "[]", CronSchedulesJson: "[]", PollingBranchesJson: null,
@@ -139,8 +153,9 @@ public class BuildDispatcherTests
 
             var bB = fx.Builds.CreateQueued(jobB.Id, BuildTrigger.Manual, "{}", null);
             dispatcher.Signal();
-            await Task.Delay(300);
-            Assert.Equal(BuildStatus.Waiting, fx.Builds.FindById(bB.Id)!.Status);
+            // Poll instead of a fixed delay: under CI resource contention a flat sleep can elapse
+            // before the dispatcher tick has moved bB from Queued to Waiting, flaking the assert below.
+            await WaitUntilStatusAsync(fx, bB.Id, BuildStatus.Waiting, TimeSpan.FromSeconds(5));
             Assert.Equal(bA.Id, locks.HolderOf("bench-1")); // UI-facing "which build blocks it" lookup
 
             await WaitUntilTerminalAsync(fx, bA.Id, TimeSpan.FromSeconds(10));
