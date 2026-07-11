@@ -75,11 +75,13 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Pester 5
-        shell: ${{ matrix.shell }}
+        # `shell:` doesn't support the matrix context, so keep it fixed and dispatch to the
+        # matrix-selected PowerShell binary from within `run:` instead.
+        shell: pwsh
         # windows-latest ships Windows PowerShell 5.1 with a built-in Pester 3.4, which does not
         # satisfy RunTests.ps1's -MinimumVersion 5.0.0 requirement.
-        run: Install-Module Pester -MinimumVersion 5.5.0 -Force -SkipPublisherCheck -Scope CurrentUser
+        run: ${{ matrix.shell }} -NoProfile -Command "Install-Module Pester -MinimumVersion 5.5.0 -Force -SkipPublisherCheck -Scope CurrentUser"
 
       - name: Run DSL tests
-        shell: ${{ matrix.shell }}
-        run: ./tests/CiRunner.Dsl.Tests/RunTests.ps1
+        shell: pwsh
+        run: ${{ matrix.shell }} -NoProfile -File ./tests/CiRunner.Dsl.Tests/RunTests.ps1
