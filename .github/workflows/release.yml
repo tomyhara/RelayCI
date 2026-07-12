@@ -73,7 +73,10 @@ jobs:
           asset="RelayCI-${{ steps.version.outputs.version }}-win-x64.zip"
           tag="${{ steps.version.outputs.tag }}"
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release edit "$tag" --title "RelayCI $tag" --generate-notes
+            # `gh release edit` has no --generate-notes (that's create-only); fetch the same
+            # auto-generated notes body via the API and pass it through --notes instead.
+            notes="$(gh api "repos/${{ github.repository }}/releases/generate-notes" -f "tag_name=$tag" --jq .body)"
+            gh release edit "$tag" --title "RelayCI $tag" --notes "$notes"
             gh release upload "$tag" "$asset" --clobber
           else
             gh release create "$tag" "$asset" --title "RelayCI $tag" --generate-notes
