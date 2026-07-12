@@ -194,6 +194,17 @@ public sealed class CiDatabase
             updated_by TEXT
         );
 
+        -- auth.mode = "local" only (spec §9): local account store. password_hash is PBKDF2-SHA256,
+        -- encoded as `<iterations>.<salt/base64>.<hash/base64>` (Pbkdf2PasswordHasher).
+        CREATE TABLE IF NOT EXISTS local_users (
+            username TEXT PRIMARY KEY,
+            password_hash TEXT NOT NULL,
+            display_name TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS artifacts (
             id INTEGER PRIMARY KEY,
             build_id INTEGER NOT NULL REFERENCES builds(id),

@@ -36,6 +36,14 @@ var config = ConfigLoader.Load(args);
 var paths = new RunnerPaths(config.RootDir);
 paths.EnsureCreated();
 
+// `ci-runner.exe user add|passwd|list|remove` (spec §9): a DB-only CLI operation, no Kestrel involved.
+// Intentionally checked before any web host setup so it works even if config.json's auth section is
+// mid-edit/invalid for the ldap path - `user` subcommands only ever touch local_users.
+if (args.Length > 0 && string.Equals(args[0], "user", StringComparison.OrdinalIgnoreCase))
+{
+    return CiRunner.Host.Cli.UserCommand.Run(args, paths);
+}
+
 // auth.localUsers (spec §9 "テスト用認証") substitutes for a real LDAP server in automated tests.
 // It must never be reachable in a Release build - refuse to start rather than silently ignore it.
 #if !DEBUG
@@ -44,15 +52,38 @@ if (config.Auth.LocalUsers is { Count: > 0 })
     throw new InvalidOperationException("auth.localUsers is a Debug-build-only setting (spec §9); refusing to start a Release build with this key set.");
 }
 #endif
-
-IAuthenticator authenticator =
+var usingDebugLocalUsersDouble =
 #if DEBUG
-    config.Auth.LocalUsers is { Count: > 0 }
-        ? new LocalUsersAuthenticator(config.Auth.LocalUsers)
-        : new LdapAuthenticator(config.Auth.Ldap);
+    config.Auth.LocalUsers is { Count: > 0 };
 #else
-    new LdapAuthenticator(config.Auth.Ldap);
+    false;
 #endif
+
+// Spec §9 "設定の整合性検証": mode=local ignores auth.ldap entirely (never validated - that's the
+// point, so switching back to LDAP later just means restoring the section). mode=ldap requires a
+// usable ldap section at startup. This check is skipped while the Debug-only localUsers double is
+// active: that mechanism substitutes for LDAP in tests regardless of what `mode` happens to say.
+if (!usingDebugLocalUsersDouble)
+{
+    if (config.Auth.Mode == "local")
+    {
+        // no-op: auth.ldap is intentionally not validated in this mode.
+    }
+    else if (config.Auth.Mode is "ldap")
+    {
+        if (string.IsNullOrEmpty(config.Auth.Ldap.Server) || string.IsNullOrEmpty(config.Auth.Ldap.SearchBase))
+        {
+            throw new InvalidOperationException("auth.mode is 'ldap' but auth.ldap.server / auth.ldap.searchBase are not configured.");
+        }
+    }
+    else
+    {
+        throw new InvalidOperationException($"auth.mode must be 'ldap' or 'local', got '{config.Auth.Mode}'.");
+    }
+}
+
+// Authenticator construction is deferred to the DI factory below (registered alongside the other
+// repositories) so it shares the single CiDatabase instance instead of opening a second one.
 
 var builder = WebApplication.CreateBuilder(args);
 builder.WebHost.UseUrls($"http://{config.Bind}:{config.Port}");
@@ -73,7 +104,12 @@ builder.Services.AddSingleton<UserRoleRepository>();
 builder.Services.AddSingleton<ApiTokenRepository>();
 builder.Services.AddSingleton<AuditLogRepository>();
 builder.Services.AddSingleton<ResourceDefRepository>();
-builder.Services.AddSingleton(authenticator);
+builder.Services.AddSingleton<LocalUserRepository>();
+builder.Services.AddSingleton<IAuthenticator>(sp => usingDebugLocalUsersDouble
+    ? new LocalUsersAuthenticator(config.Auth.LocalUsers!)
+    : config.Auth.Mode == "local"
+        ? new LocalAccountAuthenticator(sp.GetRequiredService<LocalUserRepository>())
+        : new LdapAuthenticator(config.Auth.Ldap));
 builder.Services.AddSingleton<LiveLogHub>();
 builder.Services.AddSingleton<GlobalEventHub>();
 builder.Services.AddSingleton<JobScanner>();
@@ -236,11 +272,11 @@ app.MapPost("/api/logout", async (HttpContext ctx) =>
     return Results.Ok();
 }).AllowAnonymous();
 
-app.MapGet("/api/me", (ClaimsPrincipal user) =>
+app.MapGet("/api/me", (ClaimsPrincipal user, RunnerConfig cfg) =>
 {
     if (user.Identity is not { IsAuthenticated: true })
     {
-        return Results.Ok(new { authenticated = false });
+        return Results.Ok(new { authenticated = false, authMode = cfg.Auth.Mode });
     }
     return Results.Ok(new
     {
@@ -250,6 +286,9 @@ app.MapGet("/api/me", (ClaimsPrincipal user) =>
         mail = user.FindFirst("mail")?.Value,
         role = user.FindFirst("role")?.Value,
         authMethod = user.FindFirst("authMethod")?.Value ?? "session",
+        // Spec §5 F6 "フロントがmodeを知る手段" - lets the admin UI show/hide the local-account
+        // management panel without a separate round-trip.
+        authMode = cfg.Auth.Mode,
     });
 }).AllowAnonymous();
 
@@ -291,6 +330,84 @@ app.MapDelete("/api/users/{username}/role", (string username, UserRoleRepository
     audit.Record(actorName, "role.remove", username, JsonSerializer.Serialize(new { role = before.Role }), null);
     return Results.Ok();
 }).RequireAuthorization("Admin");
+
+// ---- F6: local account management (spec §5 F6 "ユーザー / ロール" + §9 "ユーザー管理 UI") ----
+// Only mapped when auth.mode = "local" - under mode=ldap these paths simply don't exist (404), which
+// is also what the admin UI relies on to decide whether to show the local-accounts panel at all.
+if (config.Auth.Mode == "local")
+{
+    app.MapGet("/api/admin/local-users", (LocalUserRepository localUsers) => Results.Ok(localUsers.ListAll().Select(MapLocalUserForAdmin)))
+        .RequireAuthorization("Admin");
+
+    app.MapPost("/api/admin/local-users", (LocalUserCreateRequest? body, LocalUserRepository localUsers, SettingsRepository settings, AuditLogRepository audit, ClaimsPrincipal actor) =>
+    {
+        if (string.IsNullOrWhiteSpace(body?.Username))
+        {
+            return Results.BadRequest(new { error = "username is required" });
+        }
+        if (localUsers.FindByUsername(body.Username) is not null)
+        {
+            return Results.Conflict(new { error = $"local user '{body.Username}' already exists" });
+        }
+        var minLength = settings.GetInt("minPasswordLength", 8);
+        if (string.IsNullOrEmpty(body.Password) || body.Password.Length < minLength)
+        {
+            return Results.BadRequest(new { error = $"password must be at least {minLength} characters" });
+        }
+
+        var actorName = actor.Identity!.Name!;
+        var hash = Pbkdf2PasswordHasher.Hash(body.Password);
+        var user = localUsers.Add(body.Username, hash, body.DisplayName);
+        audit.Record(actorName, "localuser.create", body.Username, null, JsonSerializer.Serialize(MapLocalUserForAdmin(user)));
+        return Results.Ok(MapLocalUserForAdmin(user));
+    }).RequireAuthorization("Admin");
+
+    app.MapPost("/api/admin/local-users/{username}/password", (string username, LocalUserPasswordRequest? body, LocalUserRepository localUsers, SettingsRepository settings, AuditLogRepository audit, ClaimsPrincipal actor) =>
+    {
+        if (localUsers.FindByUsername(username) is null)
+        {
+            return Results.NotFound();
+        }
+        var minLength = settings.GetInt("minPasswordLength", 8);
+        if (string.IsNullOrEmpty(body?.Password) || body.Password.Length < minLength)
+        {
+            return Results.BadRequest(new { error = $"password must be at least {minLength} characters" });
+        }
+
+        var actorName = actor.Identity!.Name!;
+        localUsers.UpdatePassword(username, Pbkdf2PasswordHasher.Hash(body.Password));
+        audit.Record(actorName, "localuser.passwd", username, null, null); // never logs the password itself
+        return Results.Ok();
+    }).RequireAuthorization("Admin");
+
+    app.MapPost("/api/admin/local-users/{username}/enabled", (string username, LocalUserEnabledRequest? body, LocalUserRepository localUsers, AuditLogRepository audit, ClaimsPrincipal actor) =>
+    {
+        var existing = localUsers.FindByUsername(username);
+        if (existing is null)
+        {
+            return Results.NotFound();
+        }
+        var enabled = body?.Enabled ?? true;
+        localUsers.SetEnabled(username, enabled);
+        var actorName = actor.Identity!.Name!;
+        audit.Record(actorName, enabled ? "localuser.enable" : "localuser.disable", username,
+            JsonSerializer.Serialize(new { enabled = existing.Enabled }), JsonSerializer.Serialize(new { enabled }));
+        return Results.Ok();
+    }).RequireAuthorization("Admin");
+
+    app.MapDelete("/api/admin/local-users/{username}", (string username, LocalUserRepository localUsers, AuditLogRepository audit, ClaimsPrincipal actor) =>
+    {
+        var existing = localUsers.FindByUsername(username);
+        if (existing is null)
+        {
+            return Results.NotFound();
+        }
+        localUsers.Delete(username);
+        var actorName = actor.Identity!.Name!;
+        audit.Record(actorName, "localuser.delete", username, JsonSerializer.Serialize(MapLocalUserForAdmin(existing)), null);
+        return Results.Ok();
+    }).RequireAuthorization("Admin");
+}
 
 app.MapGet("/api/tokens", (ApiTokenRepository tokens) => Results.Ok(tokens.ListAll().Select(t => new
 {
@@ -339,6 +456,9 @@ app.MapGet("/api/settings", (SettingsRepository settings) => Results.Ok(new
     pollingIntervalSec = settings.GetInt("pollingIntervalSec", 60),
     testResultMode = settings.GetString("testResultMode", "strict"),
     handlerConcurrency = settings.GetInt("handlerConcurrency", 4),
+    // Spec §9 "パスワード最小長のみ(システム設定、既定 8 文字)" - applies to auth.mode=local user
+    // creation/password-reset, both via the admin API and the `user` CLI subcommand.
+    minPasswordLength = settings.GetInt("minPasswordLength", 8),
 })).RequireAuthorization("Admin");
 
 app.MapPost("/api/settings", (SettingsUpdateRequest? body, SettingsRepository settings, AuditLogRepository audit, ClaimsPrincipal actor) =>
@@ -346,6 +466,7 @@ app.MapPost("/api/settings", (SettingsUpdateRequest? body, SettingsRepository se
     if (body is null) return Results.BadRequest(new { error = "request body required" });
     if (body.Executors is { } ex && (ex < 1 || ex > 16)) return Results.BadRequest(new { error = "executors must be between 1 and 16" });
     if (body.TestResultMode is { } trm && trm is not ("strict" or "exit-code-only")) return Results.BadRequest(new { error = "testResultMode must be strict or exit-code-only" });
+    if (body.MinPasswordLength is { } mpl && mpl < 1) return Results.BadRequest(new { error = "minPasswordLength must be at least 1" });
 
     var actorName = actor.Identity!.Name!;
     var before = new Dictionary<string, string>();
@@ -363,6 +484,7 @@ app.MapPost("/api/settings", (SettingsUpdateRequest? body, SettingsRepository se
     Apply("pollingIntervalSec", body.PollingIntervalSec?.ToString());
     Apply("testResultMode", body.TestResultMode);
     Apply("handlerConcurrency", body.HandlerConcurrency?.ToString());
+    Apply("minPasswordLength", body.MinPasswordLength?.ToString());
 
     if (after.Count > 0)
     {
@@ -876,6 +998,7 @@ app.MapGet("/api/events", async (HttpContext ctx, GlobalEventHub eventHub) =>
 }).AllowAnonymous();
 
 app.Run();
+return 0;
 
 static async Task WriteSseAsync(HttpContext ctx, string text)
 {
@@ -1085,6 +1208,17 @@ static object MapHookForAdmin(HookRecord h) => new
     h.CreatedAt,
 };
 
+/// <summary>Never echoes the password hash through the API (spec §9 - only a PBKDF2 hash is ever
+/// stored, and even that stays server-side).</summary>
+static object MapLocalUserForAdmin(LocalUserRecord u) => new
+{
+    u.Username,
+    u.DisplayName,
+    u.Enabled,
+    u.CreatedAt,
+    u.UpdatedAt,
+};
+
 static void WriteHookConfig(RunnerPaths paths, string name, string? secret, int timeoutSec, bool enabled)
 {
     Directory.CreateDirectory(paths.HooksDir);
@@ -1128,6 +1262,7 @@ sealed class SettingsUpdateRequest
     public int? PollingIntervalSec { get; set; }
     public string? TestResultMode { get; set; }
     public int? HandlerConcurrency { get; set; }
+    public int? MinPasswordLength { get; set; }
 }
 
 /// <summary>Body shape for job create/update/import. Name is required for create/import and ignored on update (the route provides it).</summary>
@@ -1168,4 +1303,21 @@ sealed class ResourceDefRequest
 {
     public string? Name { get; set; }
     public string? Description { get; set; }
+}
+
+sealed class LocalUserCreateRequest
+{
+    public string? Username { get; set; }
+    public string? Password { get; set; }
+    public string? DisplayName { get; set; }
+}
+
+sealed class LocalUserPasswordRequest
+{
+    public string? Password { get; set; }
+}
+
+sealed class LocalUserEnabledRequest
+{
+    public bool? Enabled { get; set; }
 }

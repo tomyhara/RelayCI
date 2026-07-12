@@ -1058,6 +1058,11 @@ async function renderAdminAudit(el){
 
 async function renderAdminUsers(el){
   const users = await api('/api/users');
+  // Spec §5 F6 "auth.mode=local のときはローカルユーザーの作成・パスワードリセット・無効化・削除も
+  // 本画面で行う" / §9 "mode=ldap では非表示" - the panel below only renders under mode=local, and
+  // relies on the API being genuinely unmapped (404) under mode=ldap rather than just hiding the UI.
+  const isLocalMode = !!currentUser && currentUser.authMode === 'local';
+  const localUsers = isLocalMode ? await api('/api/admin/local-users') : [];
   el.innerHTML = `
     <div class="card" style="margin-bottom:16px">
       <div class="thead" style="grid-template-columns:1.4fr 130px 1fr 90px"><div>Username</div><div>Role</div><div>Updated</div><div></div></div>
@@ -1069,7 +1074,7 @@ async function renderAdminUsers(el){
           <div style="text-align:right"><button class="btn danger" style="padding:5px 10px;font-size:12px" onclick="removeUserRole('${esc(u.username)}')">Remove</button></div>
         </div>`).join('')}</div>
     </div>
-    <div class="card" style="padding:14px 16px">
+    <div class="card" style="padding:14px 16px;margin-bottom:16px">
       <div style="font-weight:600;margin-bottom:10px;font-size:13px">Assign role</div>
       <div style="display:flex;gap:8px;align-items:center">
         <input id="au-username" placeholder="username" style="flex:1;padding:8px 10px;background:var(--surface-2);border:1px solid var(--border);border-radius:7px;color:var(--text)">
@@ -1077,7 +1082,94 @@ async function renderAdminUsers(el){
         <button class="btn primary" data-testid="assign-role-btn" onclick="assignUserRole()">Assign</button>
       </div>
       <div class="login-error" id="au-error" style="display:none;margin:10px 0 0"></div>
+    </div>
+    ${isLocalMode ? renderLocalUsersHtml(localUsers) : ''}`;
+}
+
+function renderLocalUsersHtml(localUsers){
+  return `
+    <div class="card" style="margin-bottom:16px" data-testid="local-users-card">
+      <div class="thead" style="grid-template-columns:1.2fr 1fr 90px 1fr 200px"><div>Username</div><div>Display name</div><div>Status</div><div>Created</div><div></div></div>
+      <div>${localUsers.length === 0 ? `<div style="padding:16px" class="sub">No local accounts yet.</div>` : localUsers.map(u => `
+        <div class="trow" style="grid-template-columns:1.2fr 1fr 90px 1fr 200px${u.enabled ? '' : ';opacity:.5'}" data-testid="local-user-row-${esc(u.username)}">
+          <div style="font-weight:600">${esc(u.username)}</div>
+          <div class="sub">${esc(u.displayName || '')}</div>
+          <div class="mono">${u.enabled ? 'enabled' : 'disabled'}</div>
+          <div class="sub mono" style="font-size:11px">${fmtRelative(u.createdAt)}</div>
+          <div style="text-align:right;display:flex;gap:6px;justify-content:flex-end">
+            <button class="btn" style="padding:5px 8px;font-size:11px" onclick="resetLocalUserPassword('${esc(u.username)}')">Reset PW</button>
+            <button class="btn" style="padding:5px 8px;font-size:11px" onclick="toggleLocalUserEnabled('${esc(u.username)}', ${u.enabled ? 'false' : 'true'})">${u.enabled ? 'Disable' : 'Enable'}</button>
+            <button class="btn danger" style="padding:5px 8px;font-size:11px" onclick="removeLocalUser('${esc(u.username)}')">Delete</button>
+          </div>
+        </div>`).join('')}</div>
+    </div>
+    <div class="card" style="padding:14px 16px" data-testid="local-user-create-form">
+      <div style="font-weight:600;margin-bottom:10px;font-size:13px">Create local account</div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <input id="lu-username" placeholder="username" style="flex:1;min-width:120px;padding:8px 10px;background:var(--surface-2);border:1px solid var(--border);border-radius:7px;color:var(--text)">
+        <input id="lu-displayname" placeholder="display name (optional)" style="flex:1;min-width:140px;padding:8px 10px;background:var(--surface-2);border:1px solid var(--border);border-radius:7px;color:var(--text)">
+        <input id="lu-password" type="password" placeholder="password" style="flex:1;min-width:120px;padding:8px 10px;background:var(--surface-2);border:1px solid var(--border);border-radius:7px;color:var(--text)">
+        <button class="btn primary" data-testid="create-local-user-btn" onclick="createLocalUser()">Create</button>
+      </div>
+      <div class="login-error" id="lu-error" style="display:none;margin:10px 0 0"></div>
     </div>`;
+}
+
+async function createLocalUser(){
+  const username = document.getElementById('lu-username').value.trim();
+  const displayName = document.getElementById('lu-displayname').value.trim();
+  const password = document.getElementById('lu-password').value;
+  const errEl = document.getElementById('lu-error');
+  errEl.style.display = 'none';
+  if (!username || !password) return;
+  const res = await fetch('/api/admin/local-users', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password, displayName: displayName || null }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    errEl.textContent = body.error || `Failed (${res.status})`;
+    errEl.style.display = 'block';
+    return;
+  }
+  renderAdmin();
+}
+
+async function resetLocalUserPassword(username){
+  const password = prompt(`New password for "${username}":`);
+  if (!password) return;
+  const res = await fetch(`/api/admin/local-users/${encodeURIComponent(username)}/password`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    alert(body.error || `Failed (${res.status})`);
+    return;
+  }
+  alert('Password updated.');
+}
+
+async function toggleLocalUserEnabled(username, enabled){
+  const res = await fetch(`/api/admin/local-users/${encodeURIComponent(username)}/enabled`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    alert(body.error || `Failed (${res.status})`);
+    return;
+  }
+  renderAdmin();
+}
+
+async function removeLocalUser(username){
+  if (!confirm(`Delete local account "${username}"? This cannot be undone.`)) return;
+  const res = await fetch(`/api/admin/local-users/${encodeURIComponent(username)}`, { method: 'DELETE' });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    alert(body.error || `Failed (${res.status})`);
+    return;
+  }
+  renderAdmin();
 }
 
 async function assignUserRole(){
