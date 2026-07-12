@@ -2,6 +2,8 @@ using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Text.Json;
+using CiRunner.Core.Auth;
+using CiRunner.Core.Data;
 
 namespace CiRunner.Host.Tests.Support;
 
@@ -76,6 +78,83 @@ public sealed class HostProcess : IAsyncDisposable
         var port = GetFreePort();
         var configPath = WriteConfig(root, port, localUsers, initialAdmins, defaultRole, sessionHours);
         return await StartAsync(root, port, configPath, deleteRootOnDispose: true, hostDllPath);
+    }
+
+    /// <summary>auth.mode="local" (spec §9) config - no auth.localUsers/ldap section at all, since
+    /// under this mode the runner authenticates against the local_users DB table instead.</summary>
+    public static string WriteLocalAuthConfig(
+        string root,
+        int port,
+        IEnumerable<string>? initialAdmins = null,
+        string defaultRole = "viewer",
+        int sessionHours = 1)
+    {
+        Directory.CreateDirectory(root);
+        var configPath = Path.Combine(root, "config.json");
+        var json = JsonSerializer.Serialize(new
+        {
+            port,
+            bind = "127.0.0.1",
+            auth = new
+            {
+                mode = "local",
+                initialAdmins = (initialAdmins ?? Array.Empty<string>()).ToArray(),
+                defaultRole,
+                sessionHours,
+            },
+        });
+        File.WriteAllText(configPath, json);
+        return configPath;
+    }
+
+    /// <summary>Seeds local_users directly (bypassing the `user add` CLI, which is exercised
+    /// separately) so HTTP-level tests can start from a known local-account state.</summary>
+    public static void SeedLocalUser(string root, string username, string password, string? displayName = null, bool enabled = true)
+    {
+        var db = OpenTestDb(root);
+        var repo = new LocalUserRepository(db);
+        repo.Add(username, Pbkdf2PasswordHasher.Hash(password), displayName);
+        if (!enabled)
+        {
+            repo.SetEnabled(username, false);
+        }
+    }
+
+    public static void SeedSetting(string root, string key, string value)
+    {
+        var settings = new SettingsRepository(OpenTestDb(root));
+        settings.Set(key, value, "test-setup");
+    }
+
+    private static CiDatabase OpenTestDb(string root)
+    {
+        var dbPath = Path.Combine(root, "data", "ci.db");
+        Directory.CreateDirectory(Path.GetDirectoryName(dbPath)!);
+        var db = new CiDatabase(dbPath);
+        db.Migrate();
+        return db;
+    }
+
+    /// <summary>Starts a fresh temp root with auth.mode="local" and the given seeded local users.</summary>
+    public static async Task<HostProcess> StartLocalAsync(
+        IEnumerable<TestLocalUser> localUsers,
+        IEnumerable<string>? initialAdmins = null,
+        string defaultRole = "viewer",
+        int sessionHours = 1,
+        int? minPasswordLength = null)
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"ci-host-{Guid.NewGuid()}");
+        var port = GetFreePort();
+        var configPath = WriteLocalAuthConfig(root, port, initialAdmins, defaultRole, sessionHours);
+        foreach (var user in localUsers)
+        {
+            SeedLocalUser(root, user.Username, user.Password, displayName: user.Username);
+        }
+        if (minPasswordLength is { } mpl)
+        {
+            SeedSetting(root, "minPasswordLength", mpl.ToString());
+        }
+        return await StartAsync(root, port, configPath, deleteRootOnDispose: true);
     }
 
     /// <summary>Starts against an existing root/config (used to simulate a restart against the same DB).</summary>

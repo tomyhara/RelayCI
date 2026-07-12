@@ -28,6 +28,10 @@ public sealed class GhesConfig
 
 public sealed class AuthConfig
 {
+    /// <summary>"ldap" (default) or "local" (spec §9 "認証モード"). Selects who verifies the
+    /// username/password; session cookies, role resolution, and anonymous viewer access are
+    /// identical either way.</summary>
+    public string Mode { get; set; } = "ldap";
     public LdapConfig Ldap { get; set; } = new();
     public List<string> InitialAdmins { get; set; } = new();
     public string DefaultRole { get; set; } = "viewer";
