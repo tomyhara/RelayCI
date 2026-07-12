@@ -25,6 +25,7 @@ public class RoleBasedUIE2ETests : IAsyncLifetime
         var context = await browser.NewContextAsync();
         var page = await context.NewPageAsync();
         await page.GotoAsync(host.BaseUrl);
+        await page.ClickAsync("#signin-btn");
         await page.FillAsync("#login-username", username);
         await page.FillAsync("#login-password", password);
         await page.ClickAsync("#login-submit");

@@ -29,6 +29,7 @@ public class CronConfigE2ETests : IAsyncLifetime
         var context = await browser.NewContextAsync();
         var page = await context.NewPageAsync();
         await page.GotoAsync(host.BaseUrl);
+        await page.ClickAsync("#signin-btn");
         await page.FillAsync("#login-username", "admin");
         await page.FillAsync("#login-password", "admin123");
         await page.ClickAsync("#login-submit");

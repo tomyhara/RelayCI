@@ -23,6 +23,7 @@ public class LoginAndJobE2ETests : IAsyncLifetime
     private static async Task LoginAsync(IPage page, HostProcess host, string username, string password)
     {
         await page.GotoAsync(host.BaseUrl);
+        await page.ClickAsync("#signin-btn");
         await page.FillAsync("#login-username", username);
         await page.FillAsync("#login-password", password);
         await page.ClickAsync("#login-submit");
