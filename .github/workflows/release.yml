@@ -48,10 +48,17 @@ jobs:
       # Release (not Debug): auth.localUsers, the Debug-only LDAP test double, is refused at
       # startup by design (spec §9) - Release is the correct and required configuration for a
       # distributable build.
+      # PublishSingleFile collapses the ~340-file self-contained output into one .exe plus the
+      # handful of files that must stay on disk (appsettings*.json, psmodule/ scripts loaded by
+      # path, wwwroot/ static assets, web.config). DebugType=embedded folds the .pdb into the
+      # assembly instead of shipping it as a separate file.
       - name: Publish self-contained win-x64
         run: >
           dotnet publish src/CiRunner.Host -c Release -r win-x64 --self-contained true
           -p:Version=${{ steps.version.outputs.version }}
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:DebugType=embedded
           -o publish/CiRunner.Host
 
       - name: Zip artifact
