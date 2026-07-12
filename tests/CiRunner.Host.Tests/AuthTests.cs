@@ -42,8 +42,10 @@ public class AuthTests
         var unknownUser = await HttpJson.PostAsync(host.Client, "/api/login", new { username = "ghost", password = "x" });
         Assert.Equal(HttpStatusCode.Unauthorized, unknownUser.StatusCode);
 
-        var jobsRes = await host.Client.GetAsync("/api/jobs");
-        Assert.Equal(HttpStatusCode.Unauthorized, jobsRes.StatusCode);
+        // /api/jobs itself is intentionally AllowAnonymous (spec §9 "未認証閲覧", AUTH-012); a failed
+        // login should still lock the caller out of operator/admin-tier endpoints like /api/users.
+        var usersRes = await host.Client.GetAsync("/api/users");
+        Assert.Equal(HttpStatusCode.Unauthorized, usersRes.StatusCode);
     }
 
     // AUTH-004: no explicit role -> falls back to defaultRole; defaultRole=deny -> 403 at login.
@@ -165,6 +167,21 @@ public class AuthTests
         Assert.Equal(HttpStatusCode.NotFound, res.StatusCode); // hook-not-found, not 401
     }
 
+    // AUTH-012: read-only endpoints are reachable without a session (spec §9 "未認証閲覧") while
+    // state-changing/admin endpoints on the same unauthenticated client remain 401.
+    [Fact]
+    public async Task ViewerTierEndpoints_AreReachableWithoutAuthentication()
+    {
+        await using var host = await HostProcess.StartAsync(new[] { Admin }, initialAdmins: new[] { "admin" });
+
+        Assert.Equal(HttpStatusCode.OK, (await host.Client.GetAsync("/api/jobs")).StatusCode);
+        Assert.Equal(HttpStatusCode.OK, (await host.Client.GetAsync("/api/queue")).StatusCode);
+        Assert.Equal(HttpStatusCode.OK, (await host.Client.GetAsync("/api/status")).StatusCode);
+
+        Assert.Equal(HttpStatusCode.Unauthorized, (await host.Client.PostAsync("/api/jobs/nope/trigger", null)).StatusCode);
+        Assert.Equal(HttpStatusCode.Unauthorized, (await host.Client.GetAsync("/api/admin/jobs")).StatusCode);
+    }
+
     // AUTH-009 + AUTH-011 (token portion): issue -> Bearer access -> revoke -> 401, with audit_log entries.
     [Fact]
     public async Task ApiToken_IssueUseRevokeLifecycle_IsAuditLogged()
@@ -178,14 +195,17 @@ public class AuthTests
         var rawToken = issued.RootElement.GetProperty("token").GetString();
         var tokenId = issued.RootElement.GetProperty("id").GetInt64();
 
+        // /api/jobs is AllowAnonymous (spec §9 "未認証閲覧", AUTH-012), so it can't distinguish a valid
+        // token from none; use an operator-tier endpoint (abort a nonexistent build - 404, not 401/403,
+        // confirms the request reached the handler) to verify the token grants access.
         using var bearerClient = new HttpClient { BaseAddress = host.Client.BaseAddress };
         bearerClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", rawToken);
-        Assert.Equal(HttpStatusCode.OK, (await bearerClient.GetAsync("/api/jobs")).StatusCode);
+        Assert.Equal(HttpStatusCode.NotFound, (await bearerClient.PostAsync("/api/builds/999999/abort", null)).StatusCode);
         Assert.Equal(HttpStatusCode.Forbidden, (await bearerClient.GetAsync("/api/users")).StatusCode); // token role is operator, not admin
 
         var revokeRes = await host.Client.DeleteAsync($"/api/tokens/{tokenId}");
         Assert.Equal(HttpStatusCode.OK, revokeRes.StatusCode);
-        Assert.Equal(HttpStatusCode.Unauthorized, (await bearerClient.GetAsync("/api/jobs")).StatusCode);
+        Assert.Equal(HttpStatusCode.Unauthorized, (await bearerClient.PostAsync("/api/builds/999999/abort", null)).StatusCode);
 
         var auditRes = await host.Client.GetAsync("/api/audit");
         using var audit = await HttpJson.ReadJsonAsync(auditRes);

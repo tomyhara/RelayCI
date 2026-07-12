@@ -200,6 +200,7 @@ h1{font-size:22px;margin:0 0 3px}
       <div class="field"><label>Username</label><input id="login-username" autocomplete="username" required></div>
       <div class="field"><label>Password</label><input id="login-password" type="password" autocomplete="current-password" required></div>
       <button class="btn primary" type="submit" style="width:100%" id="login-submit">Sign in</button>
+      <button type="button" class="btn" id="login-cancel" style="width:100%;margin-top:8px" onclick="hideLoginScreen()">Cancel</button>
     </form>
   </div>
 </div>
@@ -215,6 +216,7 @@ h1{font-size:22px;margin:0 0 3px}
     </div>
     <div style="flex:1"></div>
     <button class="iconbtn" title="Toggle theme" onclick="toggleTheme()"><span id="theme-icon"></span></button>
+    <button class="btn primary" id="signin-btn" onclick="showLoginScreen()" style="display:none">Sign in</button>
     <div class="userchip" id="user-chip" onclick="toggleUserMenu(event)" style="display:none">
       <span class="av" id="user-av"></span>
       <span><span id="user-name"></span><br><span class="role" id="user-role"></span></span>
@@ -318,14 +320,24 @@ function showLoginScreen(){
   if (pw) pw.value = '';
 }
 
+// Jobs/builds/logs are viewable without signing in (spec §9 "未認証閲覧"); this dismisses the
+// login screen back to that guest view without completing a sign-in.
+function hideLoginScreen(){
+  showApp();
+}
+
 function showApp(){
   document.getElementById('login-screen').style.display = 'none';
   document.getElementById('shell').style.display = 'grid';
-  document.getElementById('user-chip').style.display = 'flex';
-  document.getElementById('user-av').textContent = (currentUser.username||'?').slice(0,1).toUpperCase();
-  document.getElementById('user-name').textContent = currentUser.displayName || currentUser.username;
-  document.getElementById('user-role').textContent = currentUser.role;
-  document.getElementById('user-menu-username').textContent = currentUser.username;
+  const signedIn = !!currentUser;
+  document.getElementById('user-chip').style.display = signedIn ? 'flex' : 'none';
+  document.getElementById('signin-btn').style.display = signedIn ? 'none' : '';
+  if (signedIn) {
+    document.getElementById('user-av').textContent = (currentUser.username||'?').slice(0,1).toUpperCase();
+    document.getElementById('user-name').textContent = currentUser.displayName || currentUser.username;
+    document.getElementById('user-role').textContent = currentUser.role;
+    document.getElementById('user-menu-username').textContent = currentUser.username;
+  }
   document.getElementById('nav-admin').style.display = isAdmin() ? '' : 'none';
 }
 
@@ -366,7 +378,9 @@ async function onLoginSubmit(ev){
 
 async function doLogout(){
   await fetch('/api/logout', { method: 'POST' });
-  showLoginScreen();
+  currentUser = null;
+  showApp();
+  renderRoute();
 }
 
 /* ---------- theme ---------- */
@@ -1546,8 +1560,9 @@ function connectGlobalEvents(){
 /* ---------- boot ---------- */
 let booted = false;
 async function boot(){
-  const authed = await checkAuth();
-  if (!authed) { showLoginScreen(); return; }
+  // Jobs/builds/logs are viewable without signing in (spec §9 "未認証閲覧"): show the app as a
+  // guest rather than forcing the login screen when checkAuth() comes back unauthenticated.
+  await checkAuth();
   showApp();
   if (!booted) {
     booted = true;

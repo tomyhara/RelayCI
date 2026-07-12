@@ -600,6 +600,9 @@ app.MapPost("/api/admin/resources/{name}/release", (string name, ResourceLockMan
     return Results.Ok(new { releasedFromBuildId = holderId });
 }).RequireAuthorization("Admin");
 
+// Read-only endpoints down through /api/events are AllowAnonymous (spec §9 "未認証閲覧"):
+// viewing jobs/builds/logs/artifacts requires no login, but triggering, aborting, and all
+// /api/admin/* endpoints still require Operator/Admin auth.
 app.MapGet("/api/jobs", (JobRepository jobRepo, BuildRepository buildRepo) =>
 {
     var jobs = jobRepo.ListEnabled().Select(j => new
@@ -617,7 +620,7 @@ app.MapGet("/api/jobs", (JobRepository jobRepo, BuildRepository buildRepo) =>
         NextRunAt = ComputeNextRunAt(j),
     });
     return Results.Ok(jobs);
-}).RequireAuthorization("Viewer");
+}).AllowAnonymous();
 
 app.MapGet("/api/queue", (BuildRepository buildRepo, JobRepository jobRepo, ResourceLockManager resourceLocks) =>
 {
@@ -639,7 +642,7 @@ app.MapGet("/api/queue", (BuildRepository buildRepo, JobRepository jobRepo, Reso
         };
     });
     return Results.Ok(result);
-}).RequireAuthorization("Viewer");
+}).AllowAnonymous();
 
 app.MapGet("/api/status", (SettingsRepository settings, BuildRepository buildRepo, RunnerConfig cfg) =>
 {
@@ -650,7 +653,7 @@ app.MapGet("/api/status", (SettingsRepository settings, BuildRepository buildRep
         QueueLength = buildRepo.CountByStatus(BuildStatus.Queued) + buildRepo.CountByStatus(BuildStatus.Waiting),
         Port = cfg.Port,
     });
-}).RequireAuthorization("Viewer");
+}).AllowAnonymous();
 
 app.MapGet("/api/jobs/{name}/builds", (string name, JobRepository jobRepo, BuildRepository buildRepo) =>
 {
@@ -661,7 +664,7 @@ app.MapGet("/api/jobs/{name}/builds", (string name, JobRepository jobRepo, Build
     }
     var builds = buildRepo.ListByJob(job.Id).Select(MapBuildSummary);
     return Results.Ok(builds);
-}).RequireAuthorization("Viewer");
+}).AllowAnonymous();
 
 app.MapPost("/api/jobs/{name}/trigger", (string name, TriggerRequest? body, JobTriggerService triggerService) =>
 {
@@ -776,19 +779,19 @@ app.MapGet("/api/builds/{id:long}", (long id, BuildRepository buildRepo, JobRepo
         build.FinishedAt,
         Steps = steps,
     });
-}).RequireAuthorization("Viewer");
+}).AllowAnonymous();
 
 app.MapGet("/api/builds/{id:long}/tests", (long id, TestResultRepository testRepo) =>
 {
     var tests = testRepo.ListByBuild(id).Select(t => new { t.Suite, t.Name, t.Status, t.DurationMs, t.Message });
     return Results.Ok(tests);
-}).RequireAuthorization("Viewer");
+}).AllowAnonymous();
 
 app.MapGet("/api/builds/{id:long}/artifacts", (long id, ArtifactRepository artifactRepo) =>
 {
     var artifacts = artifactRepo.ListByBuild(id).Select(a => new { a.Id, a.Path, a.Size });
     return Results.Ok(artifacts);
-}).RequireAuthorization("Viewer");
+}).AllowAnonymous();
 
 app.MapGet("/api/builds/{id:long}/artifacts/{artifactId:long}/download", (long id, long artifactId, ArtifactRepository artifactRepo, RunnerPaths paths) =>
 {
@@ -805,7 +808,7 @@ app.MapGet("/api/builds/{id:long}/artifacts/{artifactId:long}/download", (long i
         return Results.NotFound();
     }
     return Results.File(fullPath, "application/octet-stream", Path.GetFileName(artifact.Path));
-}).RequireAuthorization("Viewer");
+}).AllowAnonymous();
 
 app.MapGet("/api/builds/{id:long}/log/stream", async (long id, HttpContext ctx, BuildRepository buildRepo, JobRepository jobRepo, LiveLogHub logHub, RunnerPaths paths) =>
 {
@@ -846,7 +849,7 @@ app.MapGet("/api/builds/{id:long}/log/stream", async (long id, HttpContext ctx, 
     }
 
     return Results.Empty;
-}).RequireAuthorization("Viewer");
+}).AllowAnonymous();
 
 app.MapGet("/api/events", async (HttpContext ctx, GlobalEventHub eventHub) =>
 {
@@ -870,7 +873,7 @@ app.MapGet("/api/events", async (HttpContext ctx, GlobalEventHub eventHub) =>
         eventHub.Unsubscribe(reader);
     }
     return Results.Empty;
-}).RequireAuthorization("Viewer");
+}).AllowAnonymous();
 
 app.Run();
 
