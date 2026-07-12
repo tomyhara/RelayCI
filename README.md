@@ -91,7 +91,7 @@ Stage "Test" {
     Register-JUnit "**/results.xml"
 }
 
-PostStage -When Always {
+PostStage "Publish" -When Always {
     Register-Artifact "bin/Release/**"
 }
 ```
